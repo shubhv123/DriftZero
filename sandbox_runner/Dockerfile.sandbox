@@ -1,0 +1,18 @@
+# Universal sandbox container image that runs pytest & parity checks safely for ANY library
+FROM python:3.11-slim
+
+WORKDIR /workspace
+
+# Install base test harness dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends git curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip install --no-cache-dir pytest>=8.0.0
+
+ARG TARGET_DIR="."
+COPY ${TARGET_DIR} /workspace/
+
+COPY sandbox_runner/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["test_migration_parity.py", "-v", "--tb=short"]

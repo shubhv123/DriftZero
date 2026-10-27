@@ -1,0 +1,89 @@
+{
+  "library": "pydantic",
+  "from_version": "1.10.12",
+  "to_version": "2.9.2",
+  "tavily_queries_executed": [
+    "pydantic 1.10.12 to 2.9.2 official migration guide breaking changes",
+    "pydantic 2.9.2 migration root_validator validator model_validator ValidationInfo",
+    "pydantic 2.9.2 GenericModel __root__ RootModel parse_obj_as TypeAdapter"
+  ],
+  "citations": [
+    "https://docs.pydantic.dev/latest/migration/",
+    "https://docs.pydantic.dev/latest/concepts/validators/",
+    "https://github.com/pydantic/pydantic/releases/tag/v2.0",
+    "https://github.com/modelscope/facechain/issues/621",
+    "https://github.com/conda/conda/issues/13103",
+    "https://github.com/conda/conda/issues/12969",
+    "https://github.com/pydantic/pydantic/discussions/9035",
+    "https://github.com/pydantic/pydantic/discussions/12772",
+    "https://github.com/mlflow/mlflow/issues/12654",
+    "https://github.com/pydantic/pydantic/issues/7426",
+    "https://github.com/pydantic/pydantic/discussions/6640",
+    "https://github.com/pydantic/pydantic/issues/10474"
+  ],
+  "rules": [
+    {
+      "symbol": "@root_validator(pre=True) vs @root_validator(skip_on_failure=True)",
+      "old_syntax": "@root_validator(pre=True)\ndef check(cls, values: dict) -> dict",
+      "new_syntax": "@model_validator(mode='before')\n@classmethod\ndef check(cls, values: dict) -> dict  AND  @model_validator(mode='after')\ndef check_after(self) -> Self",
+      "required_imports": [
+        "from pydantic import model_validator"
+      ],
+      "breaking_gotcha": "SILENT SEMANTIC DRIFT: In mode='after', the argument is `self` (model instance), NOT a `values` dict. Accessing `values.get()` raises AttributeError unless converted to `self.field_name`.",
+      "source_url": "https://docs.pydantic.dev/latest/migration/#root_validator-is-deprecated"
+    },
+    {
+      "symbol": "@validator with cross-field `values` or `field` inspection",
+      "old_syntax": "@validator('fx_rate', always=True)\ndef check(cls, v, values: dict, field)",
+      "new_syntax": "@field_validator('fx_rate')\n@classmethod\ndef check(cls, v, info: ValidationInfo)",
+      "required_imports": [
+        "from pydantic import field_validator, ValidationInfo"
+      ],
+      "breaking_gotcha": "`values` dict and `field` argument are replaced by `info: ValidationInfo`. Use `info.data.get('field')` and `info.field_name`. Note `always=True` is replaced by `validate_default=True` on `Field`.",
+      "source_url": "https://docs.pydantic.dev/latest/migration/#validator-and-root_validator-are-deprecated"
+    },
+    {
+      "symbol": "__root__ Custom Root Types & each_item=True",
+      "old_syntax": "class BatchMetricVector(BaseModel):\n    __root__: List[float]\n    @validator('__root__', each_item=True)",
+      "new_syntax": "class BatchMetricVector(RootModel[List[float]]):\n    root: List[float]\n    @field_validator('root')",
+      "required_imports": [
+        "from pydantic import RootModel, field_validator"
+      ],
+      "breaking_gotcha": "`__root__` attribute is renamed to `.root` via `RootModel[T]`. `each_item=True` is removed in v2; iterate over `v` inside `@field_validator('root')`.",
+      "source_url": "https://docs.pydantic.dev/latest/migration/#root-models-and-rootmodel"
+    },
+    {
+      "symbol": "GenericModel & parse_obj_as",
+      "old_syntax": "from pydantic.generics import GenericModel\nfrom pydantic import parse_obj_as",
+      "new_syntax": "from pydantic import BaseModel, TypeAdapter\nclass Envelope(BaseModel, Generic[T]): ...\nTypeAdapter(List[Envelope]).validate_python(raw_list)",
+      "required_imports": [
+        "from pydantic import BaseModel, TypeAdapter"
+      ],
+      "breaking_gotcha": "`pydantic.generics.GenericModel` and `parse_obj_as` were removed. Inherit directly from `BaseModel, Generic[T]` and use `TypeAdapter(Type).validate_python(data)`.",
+      "source_url": "https://docs.pydantic.dev/latest/migration/#generic-models"
+    },
+    {
+      "symbol": "class Config, .dict(), .json(), .parse_obj(), Field(regex=...)",
+      "old_syntax": "class Config: orm_mode = True; model.dict(); model.json(); Model.parse_obj(d); Field(regex=r'...')",
+      "new_syntax": "model_config = ConfigDict(from_attributes=True); model.model_dump(); model.model_dump_json(); Model.model_validate(d); Field(pattern=r'...')",
+      "required_imports": [
+        "from pydantic import ConfigDict"
+      ],
+      "breaking_gotcha": "`min_items`/`max_items` on list `Field` must become `min_length`/`max_length`. `allow_mutation=False` becomes `frozen=True`. `allow_population_by_field_name=True` becomes `populate_by_name=True`.",
+      "source_url": "https://docs.pydantic.dev/latest/migration/#changes-to-pydantic-basemodel"
+    },
+    {
+      "symbol": "BaseSettings & OpenAI ChatCompletion",
+      "old_syntax": "from pydantic import BaseSettings; openai.ChatCompletion.create(...)",
+      "new_syntax": "from pydantic_settings import BaseSettings, SettingsConfigDict; from openai import OpenAI; OpenAI().chat.completions.create(...)",
+      "required_imports": [
+        "from pydantic_settings import BaseSettings, SettingsConfigDict",
+        "from openai import OpenAI"
+      ],
+      "breaking_gotcha": "`BaseSettings` lives in the separate `pydantic-settings` package in v2.",
+      "source_url": "https://docs.pydantic.dev/latest/migration/#basesettings-has-moved-to-pydantic-settings"
+    }
+  ],
+  "synthesized_by_model": "nvidia/nemotron-3-super-120b-a12b",
+  "generation_latency_ms": 21459.61
+}

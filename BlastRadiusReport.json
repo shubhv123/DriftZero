@@ -1,0 +1,542 @@
+{
+  "repo_path": "/Users/apple/antigravity/DriftZero/demo_target_repo",
+  "target_library": "pydantic",
+  "old_version": "1.10.12",
+  "target_version": "2.9.2",
+  "scan_duration_ms": 3.6,
+  "total_files_scanned": 8,
+  "affected_files_count": 8,
+  "super_routed_count": 6,
+  "ultra_routed_count": 2,
+  "estimated_cost_savings_pct": 62.5,
+  "unique_deprecated_symbols": [
+    ".construct()",
+    ".copy()",
+    ".dict()",
+    ".json()",
+    ".parse_obj()",
+    ".parse_raw()",
+    ".schema_json()",
+    "@root_validator",
+    "@root_validator(pre=True)",
+    "@validator",
+    "@validator(..., each_item=True)",
+    "Config.allow_mutation",
+    "Config.allow_population_by_field_name",
+    "Config.anystr_strip_whitespace",
+    "Config.copy_on_model_validation",
+    "Config.json_encoders",
+    "Config.orm_mode",
+    "Field(max_items=...)",
+    "Field(min_items=...)",
+    "Field(regex=...)",
+    "GenericModel (Class Inheritance)",
+    "__root__",
+    "class Config",
+    "openai.ChatCompletion.create",
+    "parse_obj_as()",
+    "pydantic.BaseSettings",
+    "pydantic.generics.GenericModel",
+    "pydantic.parse_obj_as",
+    "validator(cross_field_values)"
+  ],
+  "tavily_search_queries": [
+    "pydantic 1.10.12 to 2.9.2 official migration guide breaking changes",
+    "pydantic 2.9.2 migration root_validator validator model_validator ValidationInfo",
+    "pydantic 2.9.2 GenericModel __root__ RootModel parse_obj_as TypeAdapter"
+  ],
+  "affected_files": [
+    {
+      "file_path": "/Users/apple/antigravity/DriftZero/demo_target_repo/src/inheritance_pipeline.py",
+      "relative_path": "src/inheritance_pipeline.py",
+      "total_lines": 48,
+      "imports_found": [
+        "pydantic.BaseModel",
+        "pydantic.validator",
+        "pydantic.root_validator",
+        "pydantic.parse_obj_as",
+        "pydantic.generics.GenericModel"
+      ],
+      "usages": [
+        {
+          "symbol_name": "pydantic.parse_obj_as",
+          "usage_type": "import",
+          "line_number": 2,
+          "code_snippet": "from pydantic import BaseModel, validator, root_validator, parse_obj_as",
+          "complexity_weight": 3,
+          "deprecation_hint": "Replace `parse_obj_as` with `TypeAdapter`"
+        },
+        {
+          "symbol_name": "pydantic.generics.GenericModel",
+          "usage_type": "import",
+          "line_number": 3,
+          "code_snippet": "from pydantic.generics import GenericModel",
+          "complexity_weight": 4,
+          "deprecation_hint": "Replace `GenericModel` with `BaseModel, Generic[T]`"
+        },
+        {
+          "symbol_name": "__root__",
+          "usage_type": "special_field",
+          "line_number": 9,
+          "code_snippet": "__root__: List[float]",
+          "complexity_weight": 5,
+          "deprecation_hint": "Convert `__root__` model into `class Model(RootModel[T]): root: T`"
+        },
+        {
+          "symbol_name": "@validator(..., each_item=True)",
+          "usage_type": "decorator",
+          "line_number": 11,
+          "code_snippet": "@validator(\"__root__\", each_item=True)",
+          "complexity_weight": 5,
+          "deprecation_hint": "`each_item=True` removed in v2; use `Annotated[List[Annotated[T, AfterValidator(...)]]]`"
+        },
+        {
+          "symbol_name": "GenericModel (Class Inheritance)",
+          "usage_type": "base_class",
+          "line_number": 22,
+          "code_snippet": "class EnvelopeContext(GenericModel, Generic[PayloadT]):",
+          "complexity_weight": 4,
+          "deprecation_hint": "Restructure class inheritance to `BaseModel, Generic[T]`"
+        },
+        {
+          "symbol_name": "class Config",
+          "usage_type": "config_attr",
+          "line_number": 28,
+          "code_snippet": "class Config:",
+          "complexity_weight": 1,
+          "deprecation_hint": "Migrate inner `class Config:` to `model_config = ConfigDict(...)`"
+        },
+        {
+          "symbol_name": "Config.copy_on_model_validation",
+          "usage_type": "config_attr",
+          "line_number": 30,
+          "code_snippet": "copy_on_model_validation = \"deep\"",
+          "complexity_weight": 2,
+          "deprecation_hint": "Removed in Pydantic v2 (`copy_on_model_validation`); remove or handle via validator"
+        },
+        {
+          "symbol_name": "@validator",
+          "usage_type": "decorator",
+          "line_number": 32,
+          "code_snippet": "@validator(\"attempt_count\")",
+          "complexity_weight": 3,
+          "deprecation_hint": "Migrate `@validator` to `@field_validator` with `@classmethod`"
+        },
+        {
+          "symbol_name": "validator(cross_field_values)",
+          "usage_type": "decorator",
+          "line_number": 33,
+          "code_snippet": "def check_attempt_limit(cls, v: int, field) -> int:",
+          "complexity_weight": 4,
+          "deprecation_hint": "Replace `values: dict` / `field` arg with `info: ValidationInfo` (`info.data`, `info.field_name`)"
+        },
+        {
+          "symbol_name": "@root_validator",
+          "usage_type": "decorator",
+          "line_number": 38,
+          "code_snippet": "@root_validator",
+          "complexity_weight": 5,
+          "deprecation_hint": "Migrate to `@model_validator(mode='before' if pre else 'after')`"
+        },
+        {
+          "symbol_name": "parse_obj_as()",
+          "usage_type": "method_call",
+          "line_number": 47,
+          "code_snippet": "parsed = parse_obj_as(List[EnvelopeContext[Dict[str, Any]]], raw_list)",
+          "complexity_weight": 3,
+          "deprecation_hint": "Replace `parse_obj_as(Type, obj)` with `TypeAdapter(Type).validate_python(obj)`"
+        }
+      ],
+      "raw_complexity_score": 65,
+      "normalized_score": 10,
+      "assigned_tier": "NEMOTRON_ULTRA",
+      "target_model_id": "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1",
+      "routing_reasons": [
+        "Contains @root_validator (requires mode='before'/'after' + cls/self signature flip)",
+        "Validator inspects cross-field `values` dict (requires Pydantic v2 ValidationInfo migration)",
+        "Inherits from GenericModel (requires BaseModel + Generic[T] MRO restructuring)",
+        "Defines `__root__` field (requires refactoring class into RootModel[T] subclass)",
+        "Uses `@validator(..., each_item=True)` (removed in v2; requires Annotated TypeAdapter/AfterValidator)",
+        "Multiple validation decorators (4) interacting in same class scope"
+      ]
+    },
+    {
+      "file_path": "/Users/apple/antigravity/DriftZero/demo_target_repo/src/risk_validator_engine.py",
+      "relative_path": "src/risk_validator_engine.py",
+      "total_lines": 62,
+      "imports_found": [
+        "pydantic.BaseModel",
+        "pydantic.Field",
+        "pydantic.validator",
+        "pydantic.root_validator"
+      ],
+      "usages": [
+        {
+          "symbol_name": "class Config",
+          "usage_type": "config_attr",
+          "line_number": 11,
+          "code_snippet": "class Config:",
+          "complexity_weight": 1,
+          "deprecation_hint": "Migrate inner `class Config:` to `model_config = ConfigDict(...)`"
+        },
+        {
+          "symbol_name": "Config.json_encoders",
+          "usage_type": "config_attr",
+          "line_number": 12,
+          "code_snippet": "json_encoders = {",
+          "complexity_weight": 3,
+          "deprecation_hint": "Replace `json_encoders` in Config with `@field_serializer` decorators"
+        },
+        {
+          "symbol_name": "@root_validator(pre=True)",
+          "usage_type": "decorator",
+          "line_number": 27,
+          "code_snippet": "@root_validator(pre=True)",
+          "complexity_weight": 5,
+          "deprecation_hint": "Migrate to `@model_validator(mode='before' if pre else 'after')`"
+        },
+        {
+          "symbol_name": "@validator",
+          "usage_type": "decorator",
+          "line_number": 37,
+          "code_snippet": "@validator(\"fx_rate\", always=True)",
+          "complexity_weight": 3,
+          "deprecation_hint": "Migrate `@validator` to `@field_validator` with `@classmethod`"
+        },
+        {
+          "symbol_name": "validator(cross_field_values)",
+          "usage_type": "decorator",
+          "line_number": 38,
+          "code_snippet": "def validate_cross_border_fx_rate(cls, v: Optional[Decimal], values: Dict[str, Any]) -> Decimal:",
+          "complexity_weight": 4,
+          "deprecation_hint": "Replace `values: dict` / `field` arg with `info: ValidationInfo` (`info.data`, `info.field_name`)"
+        },
+        {
+          "symbol_name": "@root_validator",
+          "usage_type": "decorator",
+          "line_number": 47,
+          "code_snippet": "@root_validator(skip_on_failure=True)",
+          "complexity_weight": 5,
+          "deprecation_hint": "Migrate to `@model_validator(mode='before' if pre else 'after')`"
+        },
+        {
+          "symbol_name": ".dict()",
+          "usage_type": "method_call",
+          "line_number": 60,
+          "code_snippet": "raw = self.dict(exclude_none=False)",
+          "complexity_weight": 1,
+          "deprecation_hint": "Replace `.dict()` with `.model_dump()`"
+        },
+        {
+          "symbol_name": ".json()",
+          "usage_type": "method_call",
+          "line_number": 61,
+          "code_snippet": "raw[\"serialized_json\"] = self.json()",
+          "complexity_weight": 1,
+          "deprecation_hint": "Replace `.json()` with `.model_dump_json()`"
+        }
+      ],
+      "raw_complexity_score": 35,
+      "normalized_score": 10,
+      "assigned_tier": "NEMOTRON_ULTRA",
+      "target_model_id": "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1",
+      "routing_reasons": [
+        "Contains @root_validator (requires mode='before'/'after' + cls/self signature flip)",
+        "Validator inspects cross-field `values` dict (requires Pydantic v2 ValidationInfo migration)",
+        "Multiple validation decorators (4) interacting in same class scope"
+      ]
+    },
+    {
+      "file_path": "/Users/apple/antigravity/DriftZero/demo_target_repo/src/customer_models.py",
+      "relative_path": "src/customer_models.py",
+      "total_lines": 22,
+      "imports_found": [
+        "pydantic.BaseModel",
+        "pydantic.Field"
+      ],
+      "usages": [
+        {
+          "symbol_name": "Field(regex=...)",
+          "usage_type": "method_call",
+          "line_number": 8,
+          "code_snippet": "postal_code: str = Field(..., regex=r\"^\\d{5}(-\\d{4})?$\")",
+          "complexity_weight": 1,
+          "deprecation_hint": "Replace `Field(..., regex=...)` with `Field(..., pattern=...)`"
+        },
+        {
+          "symbol_name": "Field(regex=...)",
+          "usage_type": "method_call",
+          "line_number": 13,
+          "code_snippet": "email: str = Field(..., regex=r\"^[\\w\\.-]+@[\\w\\.-]+\\.\\w+$\")",
+          "complexity_weight": 1,
+          "deprecation_hint": "Replace `Field(..., regex=...)` with `Field(..., pattern=...)`"
+        },
+        {
+          "symbol_name": "Field(min_items=...)",
+          "usage_type": "method_call",
+          "line_number": 14,
+          "code_snippet": "tags: List[str] = Field(default_factory=list, min_items=1, max_items=10)",
+          "complexity_weight": 1,
+          "deprecation_hint": "Replace `Field(..., min_items=...)` with `Field(..., min_length=...)`"
+        },
+        {
+          "symbol_name": "Field(max_items=...)",
+          "usage_type": "method_call",
+          "line_number": 14,
+          "code_snippet": "tags: List[str] = Field(default_factory=list, min_items=1, max_items=10)",
+          "complexity_weight": 1,
+          "deprecation_hint": "Replace `Field(..., max_items=...)` with `Field(..., max_length=...)`"
+        },
+        {
+          "symbol_name": "class Config",
+          "usage_type": "config_attr",
+          "line_number": 17,
+          "code_snippet": "class Config:",
+          "complexity_weight": 1,
+          "deprecation_hint": "Migrate inner `class Config:` to `model_config = ConfigDict(...)`"
+        },
+        {
+          "symbol_name": "Config.anystr_strip_whitespace",
+          "usage_type": "config_attr",
+          "line_number": 18,
+          "code_snippet": "anystr_strip_whitespace = True",
+          "complexity_weight": 1,
+          "deprecation_hint": "Replace `anystr_strip_whitespace` with `str_strip_whitespace=True`"
+        },
+        {
+          "symbol_name": "Config.allow_mutation",
+          "usage_type": "config_attr",
+          "line_number": 19,
+          "code_snippet": "allow_mutation = False",
+          "complexity_weight": 2,
+          "deprecation_hint": "Replace `allow_mutation = False` with `frozen=True` in ConfigDict"
+        },
+        {
+          "symbol_name": ".dict()",
+          "usage_type": "method_call",
+          "line_number": 22,
+          "code_snippet": "return self.dict(exclude_none=True)",
+          "complexity_weight": 1,
+          "deprecation_hint": "Replace `.dict()` with `.model_dump()`"
+        }
+      ],
+      "raw_complexity_score": 9,
+      "normalized_score": 5,
+      "assigned_tier": "NEMOTRON_SUPER",
+      "target_model_id": "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
+      "routing_reasons": [
+        "Deterministic syntactic deprecation pattern (safe for fast Nemotron Super execution)"
+      ]
+    },
+    {
+      "file_path": "/Users/apple/antigravity/DriftZero/demo_target_repo/src/order_schemas.py",
+      "relative_path": "src/order_schemas.py",
+      "total_lines": 30,
+      "imports_found": [
+        "pydantic.BaseModel",
+        "pydantic.Field"
+      ],
+      "usages": [
+        {
+          "symbol_name": "class Config",
+          "usage_type": "config_attr",
+          "line_number": 17,
+          "code_snippet": "class Config:",
+          "complexity_weight": 1,
+          "deprecation_hint": "Migrate inner `class Config:` to `model_config = ConfigDict(...)`"
+        },
+        {
+          "symbol_name": "Config.orm_mode",
+          "usage_type": "config_attr",
+          "line_number": 18,
+          "code_snippet": "orm_mode = True",
+          "complexity_weight": 1,
+          "deprecation_hint": "Replace `orm_mode = True` with `model_config = ConfigDict(from_attributes=True)`"
+        },
+        {
+          "symbol_name": ".parse_obj()",
+          "usage_type": "method_call",
+          "line_number": 22,
+          "code_snippet": "return OrderRequest.parse_obj(raw_dict)",
+          "complexity_weight": 2,
+          "deprecation_hint": "Replace `.parse_obj()` with `.model_validate()`"
+        },
+        {
+          "symbol_name": ".parse_raw()",
+          "usage_type": "method_call",
+          "line_number": 26,
+          "code_snippet": "return OrderRequest.parse_raw(raw_json)",
+          "complexity_weight": 2,
+          "deprecation_hint": "Replace `.parse_raw()` with `.model_validate_json()`"
+        },
+        {
+          "symbol_name": ".schema_json()",
+          "usage_type": "method_call",
+          "line_number": 30,
+          "code_snippet": "return OrderRequest.schema_json(indent=2)",
+          "complexity_weight": 2,
+          "deprecation_hint": "Replace `.schema_json()` with `.model_json_schema()`"
+        }
+      ],
+      "raw_complexity_score": 8,
+      "normalized_score": 4,
+      "assigned_tier": "NEMOTRON_SUPER",
+      "target_model_id": "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
+      "routing_reasons": [
+        "Deterministic syntactic deprecation pattern (safe for fast Nemotron Super execution)"
+      ]
+    },
+    {
+      "file_path": "/Users/apple/antigravity/DriftZero/demo_target_repo/src/config.py",
+      "relative_path": "src/config.py",
+      "total_lines": 16,
+      "imports_found": [
+        "pydantic.BaseSettings",
+        "pydantic.Field"
+      ],
+      "usages": [
+        {
+          "symbol_name": "pydantic.BaseSettings",
+          "usage_type": "import",
+          "line_number": 1,
+          "code_snippet": "from pydantic import BaseSettings, Field",
+          "complexity_weight": 2,
+          "deprecation_hint": "Moved to `from pydantic_settings import BaseSettings` in Pydantic v2"
+        },
+        {
+          "symbol_name": "class Config",
+          "usage_type": "config_attr",
+          "line_number": 9,
+          "code_snippet": "class Config:",
+          "complexity_weight": 1,
+          "deprecation_hint": "Migrate inner `class Config:` to `model_config = ConfigDict(...)`"
+        },
+        {
+          "symbol_name": ".dict()",
+          "usage_type": "method_call",
+          "line_number": 16,
+          "code_snippet": "return settings.dict()",
+          "complexity_weight": 1,
+          "deprecation_hint": "Replace `.dict()` with `.model_dump()`"
+        }
+      ],
+      "raw_complexity_score": 4,
+      "normalized_score": 2,
+      "assigned_tier": "NEMOTRON_SUPER",
+      "target_model_id": "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
+      "routing_reasons": [
+        "Deterministic syntactic deprecation pattern (safe for fast Nemotron Super execution)"
+      ]
+    },
+    {
+      "file_path": "/Users/apple/antigravity/DriftZero/demo_target_repo/src/llm_summarizer.py",
+      "relative_path": "src/llm_summarizer.py",
+      "total_lines": 24,
+      "imports_found": [
+        "openai",
+        "pydantic.BaseModel",
+        "pydantic.Field"
+      ],
+      "usages": [
+        {
+          "symbol_name": ".dict()",
+          "usage_type": "method_call",
+          "line_number": 11,
+          "code_snippet": "data = self.dict()",
+          "complexity_weight": 1,
+          "deprecation_hint": "Replace `.dict()` with `.model_dump()`"
+        },
+        {
+          "symbol_name": "openai.ChatCompletion.create",
+          "usage_type": "method_call",
+          "line_number": 19,
+          "code_snippet": "response = openai.ChatCompletion.create(",
+          "complexity_weight": 2,
+          "deprecation_hint": "Replace `openai.ChatCompletion.create()` with `OpenAI().chat.completions.create()`"
+        }
+      ],
+      "raw_complexity_score": 3,
+      "normalized_score": 2,
+      "assigned_tier": "NEMOTRON_SUPER",
+      "target_model_id": "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
+      "routing_reasons": [
+        "Deterministic syntactic deprecation pattern (safe for fast Nemotron Super execution)"
+      ]
+    },
+    {
+      "file_path": "/Users/apple/antigravity/DriftZero/demo_target_repo/src/webhook_events.py",
+      "relative_path": "src/webhook_events.py",
+      "total_lines": 16,
+      "imports_found": [
+        "pydantic.BaseModel",
+        "pydantic.Field"
+      ],
+      "usages": [
+        {
+          "symbol_name": "class Config",
+          "usage_type": "config_attr",
+          "line_number": 10,
+          "code_snippet": "class Config:",
+          "complexity_weight": 1,
+          "deprecation_hint": "Migrate inner `class Config:` to `model_config = ConfigDict(...)`"
+        },
+        {
+          "symbol_name": "Config.allow_population_by_field_name",
+          "usage_type": "config_attr",
+          "line_number": 11,
+          "code_snippet": "allow_population_by_field_name = True",
+          "complexity_weight": 1,
+          "deprecation_hint": "Replace `allow_population_by_field_name` with `populate_by_name=True`"
+        },
+        {
+          "symbol_name": ".construct()",
+          "usage_type": "method_call",
+          "line_number": 16,
+          "code_snippet": "return StripeWebhookEvent.construct(**raw_data)",
+          "complexity_weight": 2,
+          "deprecation_hint": "Replace `.construct()` with `.model_construct()`"
+        }
+      ],
+      "raw_complexity_score": 4,
+      "normalized_score": 2,
+      "assigned_tier": "NEMOTRON_SUPER",
+      "target_model_id": "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
+      "routing_reasons": [
+        "Deterministic syntactic deprecation pattern (safe for fast Nemotron Super execution)"
+      ]
+    },
+    {
+      "file_path": "/Users/apple/antigravity/DriftZero/demo_target_repo/src/serializers.py",
+      "relative_path": "src/serializers.py",
+      "total_lines": 16,
+      "imports_found": [
+        "pydantic.BaseModel"
+      ],
+      "usages": [
+        {
+          "symbol_name": ".json()",
+          "usage_type": "method_call",
+          "line_number": 12,
+          "code_snippet": "return order.json(by_alias=True, exclude_unset=True)",
+          "complexity_weight": 1,
+          "deprecation_hint": "Replace `.json()` with `.model_dump_json()`"
+        },
+        {
+          "symbol_name": ".copy()",
+          "usage_type": "method_call",
+          "line_number": 16,
+          "code_snippet": "return order.copy(update={\"order_id\": new_id}, deep=True)",
+          "complexity_weight": 1,
+          "deprecation_hint": "Replace `.copy()` with `.model_copy()`"
+        }
+      ],
+      "raw_complexity_score": 2,
+      "normalized_score": 1,
+      "assigned_tier": "NEMOTRON_SUPER",
+      "target_model_id": "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
+      "routing_reasons": [
+        "Deterministic syntactic deprecation pattern (safe for fast Nemotron Super execution)"
+      ]
+    }
+  ]
+}
