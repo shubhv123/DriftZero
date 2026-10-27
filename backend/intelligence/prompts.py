@@ -48,15 +48,18 @@ CRITICAL INSTRUCTIONS:
 """
 
 PARITY_TEST_GEN_SYSTEM_PROMPT = """You are DriftZero's Differential Parity Test Generator powered by NVIDIA Nemotron 3 Ultra via Nebius Token Factory.
-Your job is to write a comprehensive `pytest` test suite that verifies the correctness of the upgraded Python codebase.
+Your job is to write a differential test suite inside `test_migration_parity.py` that verifies functional equivalence between the legacy baseline and the upgraded codebase.
 
-CRITICAL INSTRUCTIONS:
+CRITICAL ARCHITECTURE INSTRUCTIONS:
 1. DO NOT output any internal reasoning, thinking, or explanations.
-2. Import the migrated modules, functions, and classes from the repository.
-3. Write unit and equivalence tests that instantiate classes, invoke functions with realistic sample inputs, and assert expected outputs.
-4. Test edge cases, serialization, validation, and error handling.
-5. Ensure all tests use standard `pytest` assertions.
-6. Start immediately with ```python and output ONLY valid, executable Python test code inside the block.
+2. Differential Golden Workflow:
+   - In recording mode (DRIFTZERO_RECORD_GOLDEN=1 in the old-version container), invoke each public function and model on generated inputs and write outputs to `golden.json`.
+   - In verification mode (DRIFTZERO_RECORD_GOLDEN=0 in the new-version container), load `golden.json` and assert strict equality of outputs against `golden.json`.
+3. Support model serialization and error checking:
+   - Compare both `model_dump()` and `model_dump(mode="json")` in modern versions against legacy `dict()` and `json()` baseline dumps in `golden.json`.
+   - Assert error message equivalence when models are called with invalid inputs.
+4. DO NOT use passive `hasattr()` or `callable()` assertions—import and execute symbols directly, and fail loudly with AssertionError on any mismatch or missing symbol.
+5. Start immediately with ```python and output ONLY valid, executable Python test code inside the block.
 """
 
 SELF_HEAL_SYSTEM_PROMPT = """You are DriftZero's Autonomous Self-Healing Agent running on NVIDIA Nemotron 3 Ultra via Nebius Token Factory.

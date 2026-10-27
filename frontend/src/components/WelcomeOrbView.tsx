@@ -109,7 +109,7 @@ export function WelcomeOrbView({
             <Cpu className="w-3 h-3" /> Smart Router
           </div>
           <p className="text-[10px] text-slate-400">
-            Routes syntactic files to Super (49B) and reasoning to Ultra (253B).
+            Routes syntactic files to Nemotron Super and complex reasoning to Nemotron Ultra.
           </p>
         </div>
       </div>

@@ -18,6 +18,8 @@ interface TelemetryBarProps {
   hypotheticalCostUsd: number;
   savingsPercentage: number;
   executionMode: "LIVE_NEBIUS" | "DETERMINISTIC_FALLBACK" | "AWAITING";
+  superModelLabel?: string;
+  ultraModelLabel?: string;
 }
 
 export function TelemetryBar({
@@ -27,10 +29,14 @@ export function TelemetryBar({
   hypotheticalCostUsd,
   savingsPercentage,
   executionMode,
+  superModelLabel,
+  ultraModelLabel,
 }: TelemetryBarProps) {
   const totalCalls = superCalls + ultraCalls;
   const superPct = totalCalls > 0 ? Math.round((superCalls / totalCalls) * 100) : 0;
   const ultraPct = totalCalls > 0 ? 100 - superPct : 0;
+  const superLabel = superModelLabel || "Super";
+  const ultraLabel = ultraModelLabel || "Ultra";
 
   return (
     <div className="w-full bg-[#080d19]/90 border-b border-slate-800/80 px-4 py-2.5">
@@ -52,12 +58,12 @@ export function TelemetryBar({
               <div
                 style={{ width: `${totalCalls > 0 ? superPct : 50}%` }}
                 className="bg-emerald-500 h-full transition-all duration-500"
-                title={`Super: ${superPct}%`}
+                title={`${superLabel}: ${superPct}%`}
               />
               <div
                 style={{ width: `${totalCalls > 0 ? ultraPct : 50}%` }}
                 className="bg-purple-500 h-full transition-all duration-500"
-                title={`Ultra: ${ultraPct}%`}
+                title={`${ultraLabel}: ${ultraPct}%`}
               />
             </div>
           </div>
@@ -65,11 +71,11 @@ export function TelemetryBar({
           <div className="flex items-center justify-between text-[10px] font-mono text-slate-400">
             <span className="flex items-center gap-1 text-emerald-400 font-medium">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block" />
-              Super (49B): {totalCalls > 0 ? `${superPct}%` : "--"}
+              {superLabel}: {totalCalls > 0 ? `${superPct}%` : "--"}
             </span>
             <span className="flex items-center gap-1 text-purple-400 font-medium">
               <span className="w-1.5 h-1.5 rounded-full bg-purple-400 inline-block" />
-              Ultra (253B): {totalCalls > 0 ? `${ultraPct}%` : "--"}
+              {ultraLabel}: {totalCalls > 0 ? `${ultraPct}%` : "--"}
             </span>
           </div>
         </div>
@@ -129,7 +135,7 @@ export function TelemetryBar({
           <div className="text-[10px] text-slate-500">
             {totalCalls > 0
               ? `Saved $${(hypotheticalCostUsd - actualCostUsd).toFixed(4)} vs All-Ultra`
-              : "Scores <= 5 route to Super 49B"}
+              : `Scores <= 5 route to ${superLabel}`}
           </div>
         </div>
 

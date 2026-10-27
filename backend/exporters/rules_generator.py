@@ -84,6 +84,29 @@ NEVER generate legacy `{migration_delta.from_version}` syntax from your pre-trai
     branch_name = f"driftzero/migrate-{migration_delta.library.lower()}-{migration_delta.to_version}"
     title = f"chore(deps): autonomous migration of {migration_delta.library} to {migration_delta.to_version}"
 
+    # Read updated manifest if present
+    manifest_name: Optional[str] = None
+    manifest_text: Optional[str] = None
+    req_path = patched_repo_dir / "requirements.txt"
+    if req_path.exists():
+        manifest_name = "requirements.txt"
+        manifest_text = req_path.read_text(encoding="utf-8", errors="ignore")
+    else:
+        pyproj_path = patched_repo_dir / "pyproject.toml"
+        if pyproj_path.exists():
+            manifest_name = "pyproject.toml"
+            manifest_text = pyproj_path.read_text(encoding="utf-8", errors="ignore")
+
+    # Read parity test file if present
+    parity_text: Optional[str] = None
+    test_path = patched_repo_dir / "test_migration_parity.py"
+    if test_path.exists():
+        parity_text = test_path.read_text(encoding="utf-8", errors="ignore")
+    elif stage4_report.test_file_path:
+        tf = Path(stage4_report.test_file_path)
+        if tf.exists():
+            parity_text = tf.read_text(encoding="utf-8", errors="ignore")
+
     return Stage5ExportBundle(
         cursorrules_path=str(cursor_path),
         claude_md_path=str(claude_path),
@@ -91,6 +114,9 @@ NEVER generate legacy `{migration_delta.from_version}` syntax from your pre-trai
         claude_md_content=claude_md_content,
         pr_branch_name=branch_name,
         pr_title=title,
-        pr_url=pr_url or f"https://github.com/driftzero/{migration_delta.library}-migration/pull/1",
+        pr_url=pr_url,
         status="READY_FOR_PR",
+        manifest_filename=manifest_name,
+        manifest_content=manifest_text,
+        parity_test_content=parity_text,
     )

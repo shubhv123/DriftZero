@@ -33,6 +33,9 @@ export function ContextRulesExportTab({
   const claudeContent = stage5Bundle?.claude_md_content || "";
   const prUrl = stage5Bundle?.pr_url;
   const prBranch = stage5Bundle?.pr_branch_name || "driftzero/migration";
+  const isRealGitHubPR = Boolean(
+    prUrl && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/.test(prUrl.trim())
+  );
 
   const activeContent =
     selectedFile === "cursorrules" ? cursorContent : claudeContent;
@@ -54,7 +57,7 @@ export function ContextRulesExportTab({
     try {
       const zip = new JSZip();
 
-      // Add .cursorrules and CLAUDE.md
+      // 1. Add context rules (.cursorrules and CLAUDE.md)
       if (cursorContent) {
         zip.file(".cursorrules", cursorContent);
       }
@@ -62,7 +65,32 @@ export function ContextRulesExportTab({
         zip.file("CLAUDE.md", claudeContent);
       }
 
-      // Add all patched files
+      // 2. Add updated manifest file (requirements.txt or pyproject.toml)
+      if (stage5Bundle?.manifest_filename && stage5Bundle?.manifest_content) {
+        zip.file(stage5Bundle.manifest_filename, stage5Bundle.manifest_content);
+      }
+
+      // 3. Add differential parity test suite
+      const parityTest =
+        stage5Bundle?.parity_test_content ||
+        patchedFiles.get("test_migration_parity.py")?.patched_code ||
+        patchedFiles.get("tests/test_migration_parity.py")?.patched_code;
+      if (parityTest) {
+        zip.file("test_migration_parity.py", parityTest);
+      }
+
+      // 4. Add unified diff patch
+      let fullUnifiedDiff = "";
+      patchedFiles.forEach((fileEvent, relPath) => {
+        if (fileEvent.unified_diff && fileEvent.unified_diff.trim()) {
+          fullUnifiedDiff += `--- a/${relPath}\n+++ b/${relPath}\n${fileEvent.unified_diff.trim()}\n\n`;
+        }
+      });
+      if (fullUnifiedDiff.trim()) {
+        zip.file("unified_diff.patch", fullUnifiedDiff);
+      }
+
+      // 5. Add all patched source files
       const srcFolder = zip.folder("patched_source");
       patchedFiles.forEach((fileEvent, relPath) => {
         srcFolder?.file(relPath, fileEvent.patched_code);
@@ -85,12 +113,8 @@ export function ContextRulesExportTab({
   };
 
   const handleOpenPR = () => {
-    if (prUrl) {
+    if (isRealGitHubPR && prUrl) {
       window.open(prUrl, "_blank");
-    } else {
-      alert(
-        `PR Branch '${prBranch}' is prepared locally. To push to GitHub, supply a GITHUB_TOKEN or use git push origin ${prBranch}.`
-      );
     }
   };
 
@@ -154,12 +178,21 @@ export function ContextRulesExportTab({
           {/* Open GitHub PR */}
           <button
             onClick={handleOpenPR}
-            disabled={!stage5Bundle}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 rounded-lg text-xs font-semibold border border-emerald-500/40 transition-all active:scale-95 disabled:opacity-40 shadow-sm shadow-emerald-500/10"
+            disabled={!isRealGitHubPR}
+            title={
+              isRealGitHubPR
+                ? `Open Pull Request: ${prUrl}`
+                : "Open Pull Request is enabled once a valid GitHub PR has been created via GitHub API"
+            }
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
+              isRealGitHubPR
+                ? "bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border-emerald-500/40 active:scale-95 shadow-sm shadow-emerald-500/10 cursor-pointer"
+                : "bg-slate-900/40 border-slate-800 text-slate-500 cursor-not-allowed opacity-40"
+            }`}
           >
             <GitPullRequest className="w-3.5 h-3.5 text-emerald-400" />
             <span>Open GitHub Pull Request</span>
-            {prUrl && <ExternalLink className="w-3 h-3 text-emerald-400 ml-0.5" />}
+            {isRealGitHubPR && <ExternalLink className="w-3 h-3 text-emerald-400 ml-0.5" />}
           </button>
         </div>
       </div>

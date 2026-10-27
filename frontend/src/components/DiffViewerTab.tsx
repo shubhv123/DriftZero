@@ -66,9 +66,11 @@ export function DiffViewerTab({
   const score = selectedFile.normalized_score ?? selectedFile.complexity_score ?? 1;
   const isSuper = (selectedFile.assigned_tier || "").toUpperCase().includes("SUPER");
   const modelName =
+    patchedData?.telemetry?.model_used ||
+    patchedData?.model_used ||
     selectedFile.target_model_id ||
     selectedFile.assigned_model ||
-    (isSuper ? "Nemotron-3 Super (49B)" : "Nemotron-3 Ultra (253B)");
+    (isSuper ? "Nemotron Super" : "Nemotron Ultra");
 
   const telemetry = patchedData?.telemetry;
   const latency = telemetry?.latency_ms || 0;

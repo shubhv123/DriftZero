@@ -67,6 +67,7 @@ class MigrationDelta:
     rules: List[MigrationRule]
     synthesized_by_model: str
     generation_latency_ms: float
+    uncovered_symbols: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -86,6 +87,7 @@ class TelemetryEvent:
     actual_cost_usd: float
     hypothetical_ultra_cost_usd: float
     cost_saved_usd: float
+    execution_mode: str = "NEBIUS_TOKEN_FACTORY"
 
 @dataclass
 class FilePatchResult:
@@ -97,6 +99,8 @@ class FilePatchResult:
     model_used: str
     syntax_valid: bool
     telemetry: TelemetryEvent
+    status: str = "SUCCESS"  # "SUCCESS" or "FAILED"
+    error_message: Optional[str] = None
 
 @dataclass
 class Stage3MigrationReport:
@@ -157,6 +161,9 @@ class Stage5ExportBundle:
     pr_title: str
     pr_url: Optional[str]
     status: str
+    manifest_filename: Optional[str] = None
+    manifest_content: Optional[str] = None
+    parity_test_content: Optional[str] = None
 
     def to_dict(self) -> Dict:
         return asdict(self)

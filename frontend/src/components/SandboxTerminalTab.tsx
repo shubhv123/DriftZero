@@ -35,6 +35,16 @@ export function SandboxTerminalTab({
   const stdoutText = activeAttempt?.stdout_log ?? activeAttempt?.stdout ?? "";
   const stderrText = activeAttempt?.stderr_traceback ?? activeAttempt?.stderr ?? "";
 
+  const failedAttempt = attempts.find((a) => a.exit_code !== 0) || attempts[0];
+  const healedAttempt = attempts.find((a) => Boolean(a.healed_file)) || attempts[attempts.length - 1];
+  const healedModel = healedAttempt?.healed_by_model || activeAttempt?.healed_by_model || "Nemotron Ultra";
+  const healedFile = healedAttempt?.healed_file || activeAttempt?.healed_file || "patched files";
+
+  const rawTraceback = failedAttempt?.stderr_traceback || failedAttempt?.stderr || "";
+  const failureSnippet = rawTraceback
+    ? rawTraceback.trim().split("\n").filter(Boolean).slice(-2).join(" \u2014 ")
+    : `Exit code ${failedAttempt?.exit_code ?? 1}`;
+
   return (
     <div className="h-full flex flex-col bg-[#050811] text-slate-200 overflow-hidden font-mono">
       {/* Top Banner & Attempt Selector */}
@@ -113,28 +123,33 @@ export function SandboxTerminalTab({
               </span>
             </div>
             <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-purple-500/20 border border-purple-500/40 text-purple-300">
-              Reasoning Engine: Nemotron-3 Ultra (253B)
+              Reasoning Engine: {healedModel}
             </span>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-[11px]">
-            {/* Attempt #1 failure notice */}
+            {/* Attempt failure notice */}
             <div className="p-2 rounded bg-rose-950/30 border border-rose-500/30 text-rose-300 flex items-start gap-2">
               <AlertCircle className="w-3.5 h-3.5 text-rose-400 flex-shrink-0 mt-0.5" />
-              <div>
-                <span className="font-bold">Attempt #1:</span> Edge case detected
-                subtle semantic drift in default validator behavior. Exit code:{" "}
-                {attempts[0]?.exit_code}.
+              <div className="min-w-0">
+                <div className="font-bold">
+                  Attempt #{failedAttempt?.attempt_number ?? 1} Failed (Exit {failedAttempt?.exit_code ?? 1}):
+                </div>
+                <div className="font-mono text-[10px] text-rose-200 truncate mt-0.5" title={rawTraceback}>
+                  {failureSnippet}
+                </div>
               </div>
             </div>
 
             {/* Healed action notice */}
             <div className="p-2 rounded bg-emerald-950/30 border border-emerald-500/30 text-emerald-300 flex items-start gap-2">
               <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0 mt-0.5" />
-              <div>
-                <span className="font-bold">Self-Healed:</span> Nemotron Ultra
-                intercepted stderr traceback, patched default evaluation rules,
-                and re-ran differential tests to 100% pass!
+              <div className="min-w-0">
+                <div className="font-bold">Self-Healed:</div>
+                <div className="text-emerald-200 mt-0.5">
+                  {healedModel} intercepted stderr traceback, patched{" "}
+                  <span className="font-mono text-cyan-300 font-semibold">{healedFile}</span>, and re-ran differential tests to 100% pass!
+                </div>
               </div>
             </div>
           </div>
@@ -166,7 +181,7 @@ export function SandboxTerminalTab({
                 <span className="text-cyan-400 font-mono">[{activeAttempt.healed_file}]</span>
                 <span>Interception healed semantic drift edge cases</span>
                 <span className="text-purple-400 font-mono">
-                  via {activeAttempt.healed_by_model || "nvidia/nemotron-3-ultra-253b"}
+                  via {activeAttempt.healed_by_model || healedModel}
                 </span>
               </div>
             </div>

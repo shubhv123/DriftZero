@@ -65,6 +65,7 @@ export interface MigrationDelta {
   silent_drift_warnings?: string[];
   synthesized_by_model?: string;
   generation_latency_ms?: number;
+  uncovered_symbols?: string[];
 }
 
 export interface FileTelemetry {
@@ -147,6 +148,9 @@ export interface Stage5Bundle {
   pr_branch_name: string;
   pr_title?: string;
   status?: string;
+  manifest_filename?: string;
+  manifest_content?: string;
+  parity_test_content?: string;
 }
 
 export type PipelineStage = 1 | 2 | 3 | 4 | 5;

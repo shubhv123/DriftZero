@@ -151,20 +151,36 @@ export function BlastRadiusTree({
                     </span>
 
                     {/* Model Tier Badge */}
-                    <span
-                      className={`px-1.5 py-0.2 rounded font-semibold flex items-center gap-1 ${
-                        isSuper
-                          ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
-                          : "bg-purple-500/20 text-purple-300 border border-purple-500/40"
-                      }`}
-                    >
-                      <span
-                        className={`w-1.5 h-1.5 rounded-full ${
-                          isSuper ? "bg-emerald-400" : "bg-purple-400"
-                        }`}
-                      />
-                      {isSuper ? "SUPER 49B" : "ULTRA 253B"}
-                    </span>
+                    {(() => {
+                      const patched = patchedFiles.get(file.relative_path);
+                      const rawModel =
+                        patched?.telemetry?.model_used ||
+                        patched?.model_used ||
+                        file.target_model_id ||
+                        file.assigned_model;
+                      const displayModel = rawModel
+                        ? rawModel.replace(/^nvidia\//i, "").toUpperCase()
+                        : isSuper
+                        ? "SUPER"
+                        : "ULTRA";
+
+                      return (
+                        <span
+                          className={`px-1.5 py-0.2 rounded font-semibold flex items-center gap-1 ${
+                            isSuper
+                              ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
+                              : "bg-purple-500/20 text-purple-300 border border-purple-500/40"
+                          }`}
+                        >
+                          <span
+                            className={`w-1.5 h-1.5 rounded-full ${
+                              isSuper ? "bg-emerald-400" : "bg-purple-400"
+                            }`}
+                          />
+                          {displayModel}
+                        </span>
+                      );
+                    })()}
                   </div>
 
                   {/* Symbols count */}

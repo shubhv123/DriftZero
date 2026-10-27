@@ -25,6 +25,9 @@ import { FileCode, Terminal, FileCode2, AlertCircle } from "lucide-react";
 export default function DriftZeroCommandCenter() {
   // Input parameters (Autonomous Discovery Engine handles library & version detection)
   const [repoUrl, setRepoUrl] = useState<string>("https://github.com/shubhv123/pdf-rag");
+  const [targetLibrary, setTargetLibrary] = useState<string>("");
+  const [targetVersion, setTargetVersion] = useState<string>("");
+  const [buildLog, setBuildLog] = useState<string>("");
 
   // Navigation & Workspace tabs
   const [activeSidebarView, setActiveSidebarView] = useState<
@@ -58,7 +61,7 @@ export default function DriftZeroCommandCenter() {
   // Active Selected File for Monaco Diff
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
 
-  // Telemetry Aggregates
+  // Telemetry Aggregates & Dynamic Model Labels
   const [superCalls, setSuperCalls] = useState<number>(0);
   const [ultraCalls, setUltraCalls] = useState<number>(0);
   const [actualCostUsd, setActualCostUsd] = useState<number>(0);
@@ -67,6 +70,8 @@ export default function DriftZeroCommandCenter() {
   const [executionMode, setExecutionMode] = useState<
     "LIVE_NEBIUS" | "DETERMINISTIC_FALLBACK" | "AWAITING"
   >("AWAITING");
+  const [superModelLabel, setSuperModelLabel] = useState<string>("Nemotron Super");
+  const [ultraModelLabel, setUltraModelLabel] = useState<string>("Nemotron Ultra");
 
   // Abort controller ref for active stream
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -94,11 +99,19 @@ export default function DriftZeroCommandCenter() {
     sourceVersion?: string | null;
   } | null>(null);
 
-  const startMigration = async (customRepo?: string) => {
+  const startMigration = async (
+    customRepo?: string,
+    targetLib?: string,
+    targetVer?: string,
+    customBuildLog?: string
+  ) => {
     // Cancel any existing run
     stopMigration();
 
     const activeRepo = customRepo ?? repoUrl;
+    const activeLib = targetLib !== undefined ? targetLib : targetLibrary;
+    const activeVer = targetVer !== undefined ? targetVer : targetVersion;
+    const activeBuildLog = customBuildLog !== undefined ? customBuildLog : buildLog;
 
     if (!activeRepo.trim()) {
       alert("Please provide a GitHub repository URL or directory path.");
@@ -130,14 +143,22 @@ export default function DriftZeroCommandCenter() {
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
-    // Use relative URL by default so Next.js reverse-proxies directly to backend
+    // Use POST /api/migrate/stream to handle optional target_library, target_version, and build_log
     const baseApi = process.env.NEXT_PUBLIC_API_URL || "";
-    const streamUrl = `${baseApi}/api/migrate/stream?repo_url=${encodeURIComponent(
-      activeRepo.trim()
-    )}`;
+    const streamUrl = `${baseApi}/api/migrate/stream`;
 
     try {
       const response = await fetch(streamUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          repo_url: activeRepo.trim(),
+          target_library: activeLib?.trim() || null,
+          target_version: activeVer?.trim() || null,
+          build_log: activeBuildLog?.trim() || null,
+        }),
         signal: controller.signal,
       });
 
@@ -236,6 +257,22 @@ export default function DriftZeroCommandCenter() {
         setBlastReport(report);
         if (report.affected_files && report.affected_files.length > 0) {
           setSelectedFilePath(report.affected_files[0].relative_path);
+          const superFile = report.affected_files.find((f) =>
+            (f.assigned_tier || "").toUpperCase().includes("SUPER")
+          );
+          if (superFile?.target_model_id || superFile?.assigned_model) {
+            setSuperModelLabel(
+              (superFile.target_model_id || superFile.assigned_model)!.replace(/^nvidia\//i, "")
+            );
+          }
+          const ultraFile = report.affected_files.find((f) =>
+            (f.assigned_tier || "").toUpperCase().includes("ULTRA")
+          );
+          if (ultraFile?.target_model_id || ultraFile?.assigned_model) {
+            setUltraModelLabel(
+              (ultraFile.target_model_id || ultraFile.assigned_model)!.replace(/^nvidia\//i, "")
+            );
+          }
         }
         setStageTimings((prev) => {
           const start = prev[1]?.startedAt || timestamp - report.scan_duration_ms;
@@ -276,10 +313,19 @@ export default function DriftZeroCommandCenter() {
           return next;
         });
 
-        // Update live telemetry accumulators
+        // Update live telemetry accumulators & dynamic model labels
         const tel = patchEvt.telemetry;
         if (tel) {
           const isSuper = (patchEvt.assigned_tier || tel.assigned_tier || tel.tier || "").toUpperCase().includes("SUPER");
+          const rawModel = tel.model_used || patchEvt.model_used;
+          if (rawModel) {
+            const cleanModel = rawModel.replace(/^nvidia\//i, "");
+            if (isSuper) {
+              setSuperModelLabel(cleanModel);
+            } else {
+              setUltraModelLabel(cleanModel);
+            }
+          }
           if (isSuper) {
             setSuperCalls((c) => c + 1);
           } else {
@@ -411,6 +457,12 @@ export default function DriftZeroCommandCenter() {
         <TopControlBar
           repoUrl={repoUrl}
           setRepoUrl={setRepoUrl}
+          targetLibrary={targetLibrary}
+          setTargetLibrary={setTargetLibrary}
+          targetVersion={targetVersion}
+          setTargetVersion={setTargetVersion}
+          buildLog={buildLog}
+          setBuildLog={setBuildLog}
           detectedInfo={detectedInfo}
           isRunning={isRunning}
           onRunMigration={startMigration}
@@ -433,6 +485,8 @@ export default function DriftZeroCommandCenter() {
           hypotheticalCostUsd={hypotheticalCostUsd}
           savingsPercentage={calculatedSavingsPct}
           executionMode={executionMode}
+          superModelLabel={superModelLabel}
+          ultraModelLabel={ultraModelLabel}
         />
 
         {/* Error Alert Banner if pipeline fails */}
