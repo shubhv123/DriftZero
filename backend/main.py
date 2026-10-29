@@ -4,6 +4,7 @@ import os
 import shutil
 import sys
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
@@ -30,9 +31,21 @@ from backend.intelligence.token_factory_router import (
 from backend.schemas.migration_models import Stage3MigrationReport
 from backend.verification.nebius_job_runner import execute_stage4_verification_loop
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    expected_key = (os.getenv("DRIFTZERO_API_KEY") or os.getenv("API_KEY") or "").strip()
+    if not expected_key:
+        raise RuntimeError(
+            "DRIFTZERO_API_KEY is required at startup. Refusing to boot without it."
+        )
+    yield
+
+
 app = FastAPI(
     title="DriftZero API — Universal Nebius Token Factory & Tavily Orchestrator",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -93,39 +106,58 @@ def _check_api_key(
 ) -> str:
     """
     Validates X-API-Key header or api_key query parameter.
-    If DRIFTZERO_API_KEY (or API_KEY) is set in env, it must match.
-    If unset, a non-empty X-API-Key is still required to prevent unauthenticated access.
+    DRIFTZERO_API_KEY is required at startup and must match.
     """
     provided_key = (x_api_key or api_key_query or "").strip()
     expected_key = (os.getenv("DRIFTZERO_API_KEY") or os.getenv("API_KEY") or "").strip()
 
-    if expected_key:
-        if not provided_key or provided_key != expected_key:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or missing X-API-Key header",
-            )
-    else:
-        if not provided_key:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Missing X-API-Key header",
-            )
+    if not expected_key:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="DRIFTZERO_API_KEY is not configured on server",
+        )
+
+    if not provided_key or provided_key != expected_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing X-API-Key header",
+        )
 
     return provided_key
 
 
-async def _check_rate_limit(request: Request, client_key: str) -> None:
+def _get_client_ip(request: Request) -> str:
+    """Extracts client IP from X-Forwarded-For, X-Real-IP, or client host."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+    if request.client and request.client.host:
+        return request.client.host
+    return "127.0.0.1"
+
+
+async def _check_rate_limit(request: Request, client_key: Optional[str] = None) -> None:
     """
-    Per-client sliding-window rate limiter (requests per minute).
+    Per-client sliding-window rate limiter keyed by client IP only (requests per minute).
+    Evicts stale IP buckets whose timestamps are outside the active window.
     """
-    client_ip = request.client.host if request.client else "127.0.0.1"
-    identifier = f"{client_ip}:{client_key}"
+    client_ip = _get_client_ip(request)
     now = time.time()
     window = 60.0
 
     async with _rate_limit_lock:
-        timestamps = _rate_limit_records.get(identifier, [])
+        # Evict old buckets
+        expired_keys = [
+            ip for ip, ts_list in _rate_limit_records.items()
+            if not ts_list or (now - ts_list[-1] >= window)
+        ]
+        for ip in expired_keys:
+            _rate_limit_records.pop(ip, None)
+
+        timestamps = _rate_limit_records.get(client_ip, [])
         timestamps = [t for t in timestamps if now - t < window]
         if len(timestamps) >= RATE_LIMIT_PER_MINUTE:
             raise HTTPException(
@@ -133,7 +165,7 @@ async def _check_rate_limit(request: Request, client_key: str) -> None:
                 detail=f"Rate limit exceeded: maximum {RATE_LIMIT_PER_MINUTE} requests per minute.",
             )
         timestamps.append(now)
-        _rate_limit_records[identifier] = timestamps
+        _rate_limit_records[client_ip] = timestamps
 
 
 async def _acquire_concurrency_slot() -> None:
@@ -300,6 +332,7 @@ async def _run_event_stream_pipeline(
                 "conflicts": manifest_res.conflicts,
                 "companion_packages_added": manifest_res.companion_packages_added,
                 "manifests_updated": manifest_res.manifests_updated,
+                "needs_manual": manifest_res.needs_manual,
             })
 
         yield _sse_pack("stage3_complete", s3_report.to_dict())
@@ -315,6 +348,10 @@ async def _run_event_stream_pipeline(
         if any(p.status == "FAILED" for p in s3_report.patches):
             stage4_report.final_status = "FAILED"
             print("⚠️ [Pipeline Notice] One or more Stage 3 patches failed. Overriding final_status to 'FAILED'.", flush=True)
+
+        if manifest_res.needs_manual:
+            stage4_report.final_status = "NEEDS_MANUAL"
+            print("⚠️ [Pipeline Notice] Manifest resolution required manual intervention. Setting final_status to 'NEEDS_MANUAL'.", flush=True)
 
         yield _sse_pack("stage4_complete", stage4_report.to_dict())
         await asyncio.sleep(0.15)
@@ -492,6 +529,10 @@ if __name__ == "__main__":
         if any(p.status == "FAILED" for p in s3_report.patches):
             s4.final_status = "FAILED"
             print("⚠️ [Pipeline Notice] One or more Stage 3 patches failed. Overriding final_status to 'FAILED'.", flush=True)
+
+        if manifest_res.needs_manual:
+            s4.final_status = "NEEDS_MANUAL"
+            print("⚠️ [Pipeline Notice] Manifest resolution required manual intervention. Setting final_status to 'NEEDS_MANUAL'.", flush=True)
 
         for att in s4.attempts:
             status_icon = "✅ PASSED" if att.exit_code == 0 else "❌ FAILED"

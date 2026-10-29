@@ -353,3 +353,197 @@ def test_failed_patch_overrides_final_status_and_pr():
             ws_dir, delta, stage4_report, "https://github.com/shubhv123/DriftZero", None, skip_on_fail=True
         )
         assert pr_url_skipped is None
+
+
+def test_validate_patch_py_compile_failure():
+    orig = "class LongEnoughFooModel:\n    pass\n"
+    cand = "class LongEnoughFooModel:\n    pass\n"
+    rules = []
+
+    with patch("py_compile.compile", side_effect=Exception("mocked py_compile failure")):
+        valid, err = _validate_patch(cand, orig, "pydantic", rules)
+        assert valid is False
+        assert "py_compile error: mocked py_compile failure" in err
+
+
+def test_validate_patch_subprocess_type_error():
+    orig = "from pydantic import BaseModel\nclass User(BaseModel):\n    name: str\n"
+    # In Pydantic v2, field_validator rejects unexpected kwargs with TypeError at import time
+    cand = (
+        "from pydantic import BaseModel, field_validator\n"
+        "class User(BaseModel):\n"
+        "    name: str\n"
+        "    @field_validator('name', unexpected_arg=True)\n"
+        "    @classmethod\n"
+        "    def check_name(cls, v):\n"
+        "        return v\n"
+    )
+    rules = []
+    valid, err = _validate_patch(cand, orig, "pydantic", rules)
+    assert valid is False
+    assert "Import error under target version" in err
+    assert "TypeError" in err
+    assert "unexpected_arg" in err
+
+
+def test_validate_patch_subprocess_import_error():
+    orig = "from pydantic import BaseModel\nclass User(BaseModel):\n    name: str\n"
+    cand = (
+        "from pydantic import BaseModel\n"
+        "from pydantic.nonexistent_submodule_v2 import MissingThing\n"
+        "class User(BaseModel):\n"
+        "    name: str\n"
+    )
+    rules = []
+    valid, err = _validate_patch(cand, orig, "pydantic", rules)
+    assert valid is False
+    assert "Import error under target version" in err
+    assert "ImportError" in err or "ModuleNotFoundError" in err
+
+
+def test_validate_patch_subprocess_other_runtime_errors_ignored():
+    # If module raises ValueError on import (e.g. env var missing), it does not trigger rejection
+    orig = "class User:\n    pass\n"
+    cand = (
+        "class User:\n"
+        "    pass\n"
+        "raise ValueError('Custom runtime error')\n"
+    )
+    rules = []
+    valid, err = _validate_patch(cand, orig, "pydantic", rules)
+    assert valid is True
+    assert err is None
+
+
+def test_patch_single_file_retries_on_validation_failure_and_succeeds():
+    file_rep = AffectedFileReport(
+        file_path="/fake/models.py",
+        relative_path="models.py",
+        total_lines=5,
+        imports_found=["pydantic"],
+        assigned_tier="NEMOTRON_SUPER",
+        target_model_id="super",
+        routing_reasons=["low complexity"],
+        raw_complexity_score=3,
+        normalized_score=3,
+        source_code="from pydantic import BaseModel, validator\nclass User(BaseModel):\n    name: str\n",
+        usages=[],
+    )
+    delta = MigrationDelta(
+        library="pydantic",
+        from_version="1.10.0",
+        to_version="2.9.2",
+        tavily_queries_executed=[],
+        citations=[],
+        rules=[],
+        synthesized_by_model="test",
+        generation_latency_ms=10.0,
+    )
+
+    # First attempt returns code with TypeError (invalid kwarg in field_validator)
+    attempt1_code = (
+        "```python\n"
+        "from pydantic import BaseModel, field_validator\n"
+        "class User(BaseModel):\n"
+        "    name: str\n"
+        "    @field_validator('name', bad_arg=True)\n"
+        "    @classmethod\n"
+        "    def check_name(cls, v):\n"
+        "        return v\n"
+        "```"
+    )
+    # Second attempt (retry) fixes the error
+    attempt2_code = (
+        "```python\n"
+        "from pydantic import BaseModel, field_validator\n"
+        "class User(BaseModel):\n"
+        "    name: str\n"
+        "    @field_validator('name')\n"
+        "    @classmethod\n"
+        "    def check_name(cls, v):\n"
+        "        return v\n"
+        "```"
+    )
+
+    mock_client = MagicMock()
+    resp1 = MagicMock()
+    resp1.choices = [MagicMock(message=MagicMock(content=attempt1_code, reasoning_content=None, model_extra=None))]
+    resp1.usage = MagicMock(prompt_tokens=100, completion_tokens=50)
+
+    resp2 = MagicMock()
+    resp2.choices = [MagicMock(message=MagicMock(content=attempt2_code, reasoning_content=None, model_extra=None))]
+    resp2.usage = MagicMock(prompt_tokens=150, completion_tokens=50)
+
+    mock_client.chat.completions.create.side_effect = [resp1, resp2]
+
+    with patch("backend.intelligence.token_factory_router.NEBIUS_API_KEY", "mock-key"), \
+         patch("openai.OpenAI", return_value=mock_client):
+        res = patch_single_file_via_token_factory(file_rep, delta)
+        assert res.status == "SUCCESS"
+        assert "@field_validator('name')" in res.patched_code
+        # Verify retry prompt included the validation error
+        assert mock_client.chat.completions.create.call_count == 2
+        retry_call_args = mock_client.chat.completions.create.call_args_list[1]
+        retry_messages = retry_call_args[1]["messages"]
+        user_retry_msg = retry_messages[-1]["content"]
+        assert "ERROR: Import error under target version: TypeError" in user_retry_msg
+
+
+def test_patch_single_file_fails_when_retry_also_fails_validation():
+    file_rep = AffectedFileReport(
+        file_path="/fake/models.py",
+        relative_path="models.py",
+        total_lines=5,
+        imports_found=["pydantic"],
+        assigned_tier="NEMOTRON_SUPER",
+        target_model_id="super",
+        routing_reasons=["low complexity"],
+        raw_complexity_score=3,
+        normalized_score=3,
+        source_code="from pydantic import BaseModel, validator\nclass User(BaseModel):\n    name: str\n",
+        usages=[],
+    )
+    delta = MigrationDelta(
+        library="pydantic",
+        from_version="1.10.0",
+        to_version="2.9.2",
+        tavily_queries_executed=[],
+        citations=[],
+        rules=[],
+        synthesized_by_model="test",
+        generation_latency_ms=10.0,
+    )
+
+    # Both attempts produce invalid code with TypeError
+    bad_code = (
+        "```python\n"
+        "from pydantic import BaseModel, field_validator\n"
+        "class User(BaseModel):\n"
+        "    name: str\n"
+        "    @field_validator('name', bad_arg=True)\n"
+        "    @classmethod\n"
+        "    def check_name(cls, v):\n"
+        "        return v\n"
+        "```"
+    )
+
+    mock_client = MagicMock()
+    resp1 = MagicMock()
+    resp1.choices = [MagicMock(message=MagicMock(content=bad_code, reasoning_content=None, model_extra=None))]
+    resp1.usage = MagicMock(prompt_tokens=100, completion_tokens=50)
+
+    resp2 = MagicMock()
+    resp2.choices = [MagicMock(message=MagicMock(content=bad_code, reasoning_content=None, model_extra=None))]
+    resp2.usage = MagicMock(prompt_tokens=150, completion_tokens=50)
+
+    mock_client.chat.completions.create.side_effect = [resp1, resp2]
+
+    with patch("backend.intelligence.token_factory_router.NEBIUS_API_KEY", "mock-key"), \
+         patch("openai.OpenAI", return_value=mock_client):
+        res = patch_single_file_via_token_factory(file_rep, delta)
+        assert res.status == "FAILED"
+        assert res.patched_code == ""
+        assert "Validation failed after retry" in (res.error_message or "")
+        assert "Import error under target version: TypeError" in (res.error_message or "")
+
+

@@ -80,7 +80,7 @@ def get_settings():
     assert modified is True
     assert "from pydantic_settings import BaseSettings, SettingsConfigDict" in transformed
     assert "from pydantic import Field" in transformed
-    assert "model_config = SettingsConfigDict(env_file=\".env\", case_sensitive=False)" in transformed
+    assert 'model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, populate_by_name=True, extra="ignore")' in transformed
     assert "s.model_dump()" in transformed
     assert _check_py_compile(transformed)
 
@@ -102,12 +102,70 @@ class User(BaseModel):
 """
     transformed, modified = apply_deterministic_codemods(code, target_library="pydantic")
     assert modified is True
-    assert "from pydantic import BaseModel, field_validator" in transformed
+    assert "from pydantic import BaseModel, Field, field_validator" in transformed
     assert "validator" not in transformed.split("field_validator")[0] # validator removed from import
     assert '@field_validator("name", mode="before")' in transformed
-    assert '@field_validator("age", validate_default=True)' in transformed
+    assert '@field_validator("age")' in transformed
+    assert "validate_default=True" in transformed
+    assert "age: int = Field(..., validate_default=True)" in transformed
     assert "@classmethod" in transformed
     assert _check_py_compile(transformed)
+
+
+def test_validator_values_to_validation_info_rewrite():
+    code = """from typing import Dict, Any
+from pydantic import BaseModel, validator
+
+class User(BaseModel):
+    first_name: str
+    last_name: str
+
+    @validator("last_name")
+    def val_last(cls, v, values: Dict[str, Any]):
+        first = values.get("first_name")
+        if first and not v:
+            return first
+        return v
+"""
+    transformed, modified = apply_deterministic_codemods(code, target_library="pydantic")
+    assert modified is True
+    assert "from pydantic import BaseModel, ValidationInfo, field_validator" in transformed
+    assert "def val_last(cls, v, info: ValidationInfo):" in transformed
+    assert 'first = info.data.get("first_name")' in transformed
+    assert _check_py_compile(transformed)
+
+
+def test_validator_each_item_leaves_file_residual():
+    code = """from typing import List
+from pydantic import BaseModel, validator
+
+class User(BaseModel):
+    tags: List[str]
+
+    @validator("tags", each_item=True)
+    def val_tags(cls, v):
+        return v.lower()
+"""
+    transformed, modified, can_resolve = apply_deterministic_codemods(
+        code, target_library="pydantic", return_can_resolve=True
+    )
+    assert can_resolve is False
+
+
+def test_validator_always_unmatched_field_leaves_residual():
+    code = """from pydantic import BaseModel, validator
+
+class User(BaseModel):
+    name: str
+
+    @validator("non_existent_field", always=True)
+    def val_unknown(cls, v):
+        return v
+"""
+    transformed, modified, can_resolve = apply_deterministic_codemods(
+        code, target_library="pydantic", return_can_resolve=True
+    )
+    assert can_resolve is False
 
 
 def test_root_validator_to_model_validator():
@@ -123,6 +181,8 @@ class User(BaseModel):
 
     @root_validator
     def val_after(cls, values):
+        val = values.get("a", 0)
+        values["b"] = val + 1
         return values
 
     @root_validator(skip_on_failure=True)
@@ -131,10 +191,40 @@ class User(BaseModel):
 """
     transformed, modified = apply_deterministic_codemods(code, target_library="pydantic")
     assert modified is True
+    assert "from typing import Self" in transformed
     assert "from pydantic import BaseModel, model_validator" in transformed
     assert '@model_validator(mode="before")' in transformed
     assert '@model_validator(mode="after")' in transformed
+    assert "def val_before(cls, data):" in transformed
+    assert "def val_after(self):" in transformed
+    assert 'val = getattr(self, "a", 0)' in transformed
+    assert "self.b = val + 1" in transformed
+    assert "return self" in transformed
     assert "skip_on_failure" not in transformed
+    assert _check_py_compile(transformed)
+
+
+def test_schema_json_and_field_env_rewrites():
+    code = """from pydantic import BaseModel, Field
+
+class Order(BaseModel):
+    order_id: str = Field("123", env="ORDER_ID")
+
+def export_schema():
+    return Order.schema_json(indent=2)
+"""
+    tree = ast.parse(code)
+    visitor = FileASTVisitor(code.splitlines(), "pydantic", {"Order"})
+    visitor.visit(tree)
+    lines = visitor.get_model_method_call_lines()
+
+    transformed, modified = apply_deterministic_codemods(
+        code, target_library="pydantic", model_call_lines=lines, library_classes={"Order"}
+    )
+    assert modified is True
+    assert "import json" in transformed
+    assert 'validation_alias="ORDER_ID"' in transformed
+    assert "json.dumps(Order.model_json_schema(), indent=2)" in transformed
     assert _check_py_compile(transformed)
 
 

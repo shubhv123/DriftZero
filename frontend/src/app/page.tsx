@@ -146,16 +146,14 @@ export default function DriftZeroCommandCenter() {
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
-    // Use POST /api/migrate/stream to handle optional target_library, target_version, and build_log
-    const baseApi = process.env.NEXT_PUBLIC_API_URL || "";
-    const streamUrl = `${baseApi}/api/migrate/stream`;
+    // Use POST /api/migrate/stream proxied by Next.js route handler
+    const streamUrl = "/api/migrate/stream";
 
     try {
       const response = await fetch(streamUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-API-Key": process.env.NEXT_PUBLIC_DRIFTZERO_API_KEY || "driftzero_secret_key_123",
         },
         body: JSON.stringify({
           repo_url: activeRepo.trim(),

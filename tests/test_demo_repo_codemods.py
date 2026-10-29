@@ -121,6 +121,10 @@ def test_regression_basesettings_is_migrated():
     assert "env_file=\".env\"" in codemodded_code
     assert "class Config:" not in codemodded_code
 
+    # Field(env=...) rewritten to Field(validation_alias=...)
+    assert 'validation_alias="APP_NAME"' in codemodded_code
+    assert 'validation_alias="OPENAI_API_KEY"' in codemodded_code
+
     # settings.dict() rewritten to settings.model_dump()
     assert "settings.model_dump()" in codemodded_code
     assert "settings.dict()" not in codemodded_code
@@ -197,3 +201,21 @@ def test_full_codemods_across_demo_repo(pydantic_migration_delta: MigrationDelta
         config_mod = (target_repo / "src" / "config.py").read_text()
         assert "from pydantic_settings import BaseSettings, SettingsConfigDict" in config_mod
         assert "model_config = SettingsConfigDict(" in config_mod
+        assert 'validation_alias="APP_NAME"' in config_mod
+
+        # Check order_schemas.py (.schema_json -> json.dumps(..., model_json_schema()))
+        order_schemas_mod = (target_repo / "src" / "order_schemas.py").read_text()
+        assert "import json" in order_schemas_mod
+        assert "json.dumps(OrderRequest.model_json_schema(), indent=2)" in order_schemas_mod
+        assert "OrderRequest.schema_json(" not in order_schemas_mod
+
+        # Check risk_validator_engine.py (validators and root_validators)
+        risk_mod = (target_repo / "src" / "risk_validator_engine.py").read_text()
+        assert '@model_validator(mode="before")' in risk_mod
+        assert "def normalize_country_codes_and_amounts(cls, data:" in risk_mod
+        assert '@field_validator("fx_rate")' in risk_mod
+        assert "info: ValidationInfo" in risk_mod
+        assert "validate_default = True" in risk_mod
+        assert '@model_validator(mode="after")' in risk_mod
+        assert "def enforce_high_value_compliance_policy(self)" in risk_mod
+        assert "self.requires_manual_compliance_review = True" in risk_mod

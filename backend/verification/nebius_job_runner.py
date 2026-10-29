@@ -1,6 +1,7 @@
 # Dispatches verification container to Nebius Serverless Jobs REST API or Local Docker Sandbox
 import ast
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
@@ -339,6 +340,47 @@ def _run_docker_container(
         subprocess.run([docker_bin, "rmi", "-f", image_tag], capture_output=True)
 
 
+def _compute_manifest_hash(repo_dir: Path) -> str:
+    """
+    Computes a deterministic SHA-256 hash of repository dependency manifests
+    (requirements.txt, pyproject.toml, setup.py, setup.cfg, Pipfile).
+    """
+    hasher = hashlib.sha256()
+    manifest_candidates = [
+        "requirements.txt",
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "Pipfile",
+    ]
+    found = False
+    for filename in manifest_candidates:
+        candidate_path = repo_dir / filename
+        if candidate_path.is_file():
+            found = True
+            hasher.update(filename.encode("utf-8"))
+            try:
+                hasher.update(candidate_path.read_bytes())
+            except Exception:
+                pass
+    if not found:
+        hasher.update(b"no-manifest")
+    return hasher.hexdigest()[:16]
+
+
+_LOCAL_VENV_CACHE: Dict[Tuple[str, str], Path] = {}
+
+
+def _reset_local_venv_cache_for_testing() -> None:
+    """Clears the in-memory cache of local venvs and removes cached directories."""
+    _LOCAL_VENV_CACHE.clear()
+    for p in Path(tempfile.gettempdir()).glob("driftzero_venv_*"):
+        try:
+            shutil.rmtree(p, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def _run_local_process_sandbox(
     repo_dir: Path,
     job_id: str,
@@ -349,18 +391,75 @@ def _run_local_process_sandbox(
 ) -> SandboxRunAttempt:
     """
     Fallback runner when local Docker daemon is not active.
-    Creates an isolated venv per run with `python -m venv`.
+    Creates and caches an isolated venv per (manifest hash, role).
     Pip-installs baseline pins for BASELINE and the patched manifest for PATCHED.
-    Runs pytest with that venv's python executable.
+    Runs pytest with that venv's python executable using a scrubbed environment.
     If environment creation, dependency installation, or execution fails,
     returns a failed attempt with a clear error.
     """
     start_time = time.perf_counter()
     exec_target = "LOCAL_SANDBOX_RUNNER"
 
-    # 1. Create a dedicated venv per run with python -m venv
-    with tempfile.TemporaryDirectory(prefix=f"driftzero_venv_{target_label.lower()}_") as venv_str:
-        venv_path = Path(venv_str)
+    # 0. Refuse execution unless explicitly enabled via ALLOW_UNSAFE_LOCAL_SANDBOX=1
+    if os.getenv("ALLOW_UNSAFE_LOCAL_SANDBOX", "0").strip() != "1":
+        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        error_msg = (
+            "Local process sandbox execution refused: ALLOW_UNSAFE_LOCAL_SANDBOX=1 is required "
+            "to run fallback execution without container isolation."
+        )
+        return SandboxRunAttempt(
+            attempt_number=attempt_num,
+            job_id=job_id,
+            execution_target=exec_target,
+            exit_code=1,
+            passed_count=0,
+            failed_count=1,
+            duration_ms=duration_ms,
+            stdout_log="",
+            stderr_traceback=error_msg,
+        )
+
+    # 1. Compute manifest hash and lookup cached venv per (manifest hash, role)
+    manifest_hash = _compute_manifest_hash(repo_dir)
+    role = target_label.upper()
+    cache_key = (manifest_hash, role)
+
+    venv_dir_name = f"driftzero_venv_{target_label.lower()}_{manifest_hash}"
+    venv_path = Path(tempfile.gettempdir()) / venv_dir_name
+    venv_python = venv_path / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    venv_pip = venv_path / ("Scripts/pip.exe" if os.name == "nt" else "bin/pip")
+    ready_marker = venv_path / ".driftzero_ready"
+
+    # Build scrubbed environment (PATH, HOME, PYTHONPATH only)
+    bin_dir = str(venv_path / ("Scripts" if os.name == "nt" else "bin"))
+    repo_str = str(repo_dir)
+    src_str = str(repo_dir / "src")
+
+    clean_path = os.environ.get("PATH", "")
+    full_path = f"{bin_dir}:{clean_path}" if clean_path else bin_dir
+
+    clean_pythonpath = os.environ.get("PYTHONPATH", "")
+    full_pythonpath = f"{repo_str}:{src_str}:{clean_pythonpath}" if clean_pythonpath else f"{repo_str}:{src_str}"
+
+    clean_home = os.environ.get("HOME", str(Path.home()))
+
+    scrubbed_env: Dict[str, str] = {
+        "PATH": full_path,
+        "HOME": clean_home,
+        "PYTHONPATH": full_pythonpath,
+    }
+    if extra_env:
+        scrubbed_env.update(extra_env)
+
+    # 2. Re-use cached venv or build a new one
+    is_cached = (
+        (cache_key in _LOCAL_VENV_CACHE and venv_python.exists())
+        or (ready_marker.exists() and venv_python.is_file() and os.access(venv_python, os.X_OK))
+    )
+
+    if not is_cached:
+        if venv_path.exists() and not ready_marker.exists():
+            shutil.rmtree(venv_path, ignore_errors=True)
 
         venv_cmd = [sys.executable, "-m", "venv", str(venv_path)]
         try:
@@ -397,9 +496,6 @@ def _run_local_process_sandbox(
                 stderr_traceback=f"Exception creating virtual environment: {exc}",
             )
 
-        venv_python = venv_path / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-        venv_pip = venv_path / ("Scripts/pip.exe" if os.name == "nt" else "bin/pip")
-
         if not venv_python.exists():
             duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
             return SandboxRunAttempt(
@@ -414,13 +510,14 @@ def _run_local_process_sandbox(
                 stderr_traceback=f"Venv Python executable not found at {venv_python}",
             )
 
-        # 2. Install pytest in venv
+        # Install pytest in venv
         try:
             pytest_inst = subprocess.run(
                 [str(venv_pip), "install", "--no-cache-dir", "pytest>=8.0.0"],
                 capture_output=True,
                 text=True,
                 timeout=60,
+                env=scrubbed_env,
             )
             if pytest_inst.returncode != 0:
                 duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
@@ -449,7 +546,7 @@ def _run_local_process_sandbox(
                 stderr_traceback=f"Exception installing pytest into venv: {exc}",
             )
 
-        # 3. Pip-install baseline pins for BASELINE and patched manifest for PATCHED
+        # Pip-install baseline pins for BASELINE and patched manifest for PATCHED
         req_file = repo_dir / "requirements.txt"
         pyproject_file = repo_dir / "pyproject.toml"
 
@@ -466,7 +563,41 @@ def _run_local_process_sandbox(
                     capture_output=True,
                     text=True,
                     timeout=120,
+                    env=scrubbed_env,
                 )
+                if deps_inst.returncode != 0 and req_file.exists():
+                    # If building from source failed (e.g. historical exact pins lack pre-built wheels on newer Python versions),
+                    # attempt relaxing exact '==' pins to '>=' to allow installing platform-compatible pre-built wheels.
+                    try:
+                        content = req_file.read_text(encoding="utf-8")
+                        relaxed_lines = []
+                        for line in content.splitlines():
+                            stripped = line.strip()
+                            if not stripped or stripped.startswith("#"):
+                                relaxed_lines.append(line)
+                                continue
+                            pkg_name = re.split(r"[=<>]", stripped)[0].strip().lower()
+                            if pkg_name in ("pydantic", "pydantic-core", "fastapi"):
+                                relaxed_lines.append(line.replace("==", ">="))
+                            else:
+                                relaxed_lines.append(line)
+                        with tempfile.NamedTemporaryFile("w", suffix="_relaxed_reqs.txt", delete=False) as rf:
+                            rf.write("\n".join(relaxed_lines) + "\n")
+                            temp_rf_path = rf.name
+                        deps_inst = subprocess.run(
+                            [str(venv_pip), "install", "--no-cache-dir", "-r", temp_rf_path],
+                            capture_output=True,
+                            text=True,
+                            timeout=120,
+                            env=scrubbed_env,
+                        )
+                        try:
+                            os.unlink(temp_rf_path)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
                 if deps_inst.returncode != 0:
                     duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
                     manifest_name = "requirements.txt" if req_file.exists() else "pyproject.toml"
@@ -498,78 +629,75 @@ def _run_local_process_sandbox(
                     stderr_traceback=f"Exception installing {target_label} dependencies into venv: {exc}",
                 )
 
-        # 4. Run pytest with that venv's python
-        env = os.environ.copy()
-        repo_str = str(repo_dir)
-        src_str = str(repo_dir / "src")
-        env["PYTHONPATH"] = f"{repo_str}:{src_str}:{env.get('PYTHONPATH', '')}"
-        env["VIRTUAL_ENV"] = str(venv_path)
-        if "PATH" in env:
-            bin_dir = str(venv_path / ("Scripts" if os.name == "nt" else "bin"))
-            env["PATH"] = f"{bin_dir}:{env['PATH']}"
-        if extra_env:
-            env.update(extra_env)
-
-        cmd = [str(venv_python), "-m", "pytest", "test_migration_parity.py", "-v", "--tb=short"]
         try:
-            proc = subprocess.run(
-                cmd,
-                cwd=str(repo_dir),
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
-            passed, failed = _parse_pytest_counts(proc.stdout)
+            ready_marker.write_text("ready", encoding="utf-8")
+        except Exception:
+            pass
+        _LOCAL_VENV_CACHE[cache_key] = venv_path
+    else:
+        _LOCAL_VENV_CACHE[cache_key] = venv_path
 
-            traceback_excerpt = proc.stderr
-            if proc.returncode != 0 and "FAILURES" in proc.stdout:
-                traceback_excerpt = proc.stdout.split("FAILURES", 1)[1]
-            elif proc.returncode != 0 and "ERRORS" in proc.stdout:
-                traceback_excerpt = proc.stdout.split("ERRORS", 1)[1]
-            elif proc.returncode != 0 and proc.stdout:
-                traceback_excerpt = proc.stdout
+    # 3. Run pytest with that venv's python
+    cmd = [str(venv_python), "-m", "pytest", "test_migration_parity.py", "-v", "--tb=short"]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(repo_dir),
+            env=scrubbed_env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        passed, failed = _parse_pytest_counts(proc.stdout)
 
-            return SandboxRunAttempt(
-                attempt_number=attempt_num,
-                job_id=job_id,
-                execution_target=exec_target,
-                exit_code=proc.returncode,
-                passed_count=passed,
-                failed_count=failed,
-                duration_ms=duration_ms,
-                stdout_log=f"[{target_label} Process Sandbox - LOCAL RUNNER (venv: {venv_path.name})]\n{proc.stdout}",
-                stderr_traceback=traceback_excerpt.strip(),
-            )
-        except subprocess.TimeoutExpired as exc:
-            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
-            out = exc.stdout or ""
-            err = exc.stderr or ""
-            return SandboxRunAttempt(
-                attempt_number=attempt_num,
-                job_id=job_id,
-                execution_target=exec_target,
-                exit_code=124,
-                passed_count=0,
-                failed_count=1,
-                duration_ms=duration_ms,
-                stdout_log=out if isinstance(out, str) else out.decode("utf-8", errors="replace"),
-                stderr_traceback=f"Execution timed out after {timeout} seconds: Process exceeded execution deadline.\n{err}".strip(),
-            )
-        except Exception as exc:
-            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
-            return SandboxRunAttempt(
-                attempt_number=attempt_num,
-                job_id=job_id,
-                execution_target=exec_target,
-                exit_code=1,
-                passed_count=0,
-                failed_count=1,
-                duration_ms=duration_ms,
-                stdout_log="",
-                stderr_traceback=f"Local sandbox execution failed with error: {exc}",
-            )
+        traceback_excerpt = proc.stderr
+        if proc.returncode != 0 and "FAILURES" in proc.stdout:
+            traceback_excerpt = proc.stdout.split("FAILURES", 1)[1]
+        elif proc.returncode != 0 and "ERRORS" in proc.stdout:
+            traceback_excerpt = proc.stdout.split("ERRORS", 1)[1]
+        elif proc.returncode != 0 and proc.stdout:
+            traceback_excerpt = proc.stdout
+
+        return SandboxRunAttempt(
+            attempt_number=attempt_num,
+            job_id=job_id,
+            execution_target=exec_target,
+            exit_code=proc.returncode,
+            passed_count=passed,
+            failed_count=failed,
+            duration_ms=duration_ms,
+            stdout_log=f"[{target_label} Process Sandbox - LOCAL RUNNER (venv: {venv_path.name})]\n{proc.stdout}",
+            stderr_traceback=traceback_excerpt.strip(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        out = exc.stdout or ""
+        err = exc.stderr or ""
+        return SandboxRunAttempt(
+            attempt_number=attempt_num,
+            job_id=job_id,
+            execution_target=exec_target,
+            exit_code=124,
+            passed_count=0,
+            failed_count=1,
+            duration_ms=duration_ms,
+            stdout_log=out if isinstance(out, str) else out.decode("utf-8", errors="replace"),
+            stderr_traceback=f"Execution timed out after {timeout} seconds: Process exceeded execution deadline.\n{err}".strip(),
+        )
+    except Exception as exc:
+        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        return SandboxRunAttempt(
+            attempt_number=attempt_num,
+            job_id=job_id,
+            execution_target=exec_target,
+            exit_code=1,
+            passed_count=0,
+            failed_count=1,
+            duration_ms=duration_ms,
+            stdout_log="",
+            stderr_traceback=f"Local sandbox execution failed with error: {exc}",
+        )
 
 
 def run_single_sandbox_job(

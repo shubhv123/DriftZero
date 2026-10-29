@@ -147,6 +147,20 @@ def _parse_rules_from_llm(raw_content: str) -> List[Dict[str, Any]]:
             except Exception:
                 pass
 
+    # 5. Fallback: extract individual JSON objects containing "symbol" and "new_syntax"
+    rule_blocks = re.findall(r'\{[^{}]*"symbol"[^{}]*"new_syntax"[^{}]*\}', content)
+    if rule_blocks:
+        extracted = []
+        for b in rule_blocks:
+            try:
+                obj = json.loads(b, strict=False)
+                if isinstance(obj, dict) and obj.get("symbol"):
+                    extracted.append(obj)
+            except Exception:
+                pass
+        if extracted:
+            return extracted
+
     print(f"  ⚠️ [_parse_rules_from_llm Warning] Unable to parse rules. Raw preview ({len(raw_content)} chars):\n{raw_content[:200]}...[tail]:\n{raw_content[-200:]}", flush=True)
     return []
 
@@ -317,7 +331,7 @@ def build_migration_delta(
                     {"role": "user", "content": prompt_payload + "\n\nCRITICAL: DO NOT output any internal monologue, reasoning, or analysis. Start your output immediately with {\"rules\":"},
                 ],
                 temperature=0.0,
-                max_tokens=2048,
+                max_tokens=4096,
             )
             msg = completion.choices[0].message
             raw_content = _extract_llm_text(msg)
@@ -354,7 +368,13 @@ def build_migration_delta(
 
     # Dynamic symbol grounding fallback if LLM synthesis returned empty rules
     if not rules:
-        target_symbols = blast_report.unique_deprecated_symbols or [blast_report.target_library]
+        target_symbols = [
+            s for s in (blast_report.unique_deprecated_symbols or [blast_report.target_library])
+            if not s.startswith(".") or s in (
+                ".dict()", ".json()", ".copy()", ".parse_obj()",
+                ".parse_raw()", ".schema()", ".schema_json()", ".construct()"
+            )
+        ]
         default_source = citations[0] if citations else f"https://pypi.org/project/{blast_report.target_library}/{blast_report.target_version}/"
         for sym in target_symbols[:8]:
             rules.append(

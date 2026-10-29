@@ -1,10 +1,11 @@
 FROM python:3.11-slim
 
-# Install system dependencies (git is required for repo cloning and PR workflows)
+# Install system dependencies (git for repo/PR workflows, docker.io for container sandboxing)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     build-essential \
+    docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

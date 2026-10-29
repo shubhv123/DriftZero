@@ -13,87 +13,96 @@
     "https://tomodahinata.com/en/blog/pydantic-v1-to-v2-migration-complete-guide",
     "https://github.com/pydantic/pydantic/issues/11119",
     "https://github.com/pydantic/pydantic/releases",
-    "https://github.com/python-poetry/poetry/issues/9774",
+    "https://github.com/ucsd-ets/tgpt-code-interpreter/blob/main/pyproject.toml",
     "https://pydantic.dev/docs/validation/latest/get-started/changelog",
-    "https://github.com/pydantic/pydantic/issues",
+    "https://pydantic.dev/docs/validation/dev/get-started/version-policy",
     "https://pydantic-xml.readthedocs.io/en/stable/pages/changelog.html"
   ],
   "rules": [
     {
-      "symbol": ".as_openai_messages()",
-      "old_syntax": "# Legacy usage of .as_openai_messages()",
-      "new_syntax": "# Modern replacement for .as_openai_messages() in pydantic 2.9.2",
-      "required_imports": [],
-      "breaking_gotcha": "Symbol '.as_openai_messages()' updated in pydantic 2.9.2. Check import path and argument signature.",
-      "source_url": "https://pypi.org/project/pydantic/1.10.12"
-    },
-    {
-      "symbol": ".construct()",
-      "old_syntax": "# Legacy usage of .construct()",
-      "new_syntax": "# Modern replacement for .construct() in pydantic 2.9.2",
-      "required_imports": [],
-      "breaking_gotcha": "Symbol '.construct()' updated in pydantic 2.9.2. Check import path and argument signature.",
-      "source_url": "https://pypi.org/project/pydantic/1.10.12"
-    },
-    {
-      "symbol": ".copy()",
-      "old_syntax": "# Legacy usage of .copy()",
-      "new_syntax": "# Modern replacement for .copy() in pydantic 2.9.2",
-      "required_imports": [],
-      "breaking_gotcha": "Symbol '.copy()' updated in pydantic 2.9.2. Check import path and argument signature.",
-      "source_url": "https://pypi.org/project/pydantic/1.10.12"
-    },
-    {
       "symbol": ".dict()",
-      "old_syntax": "# Legacy usage of .dict()",
-      "new_syntax": "# Modern replacement for .dict() in pydantic 2.9.2",
+      "old_syntax": "model.dict()",
+      "new_syntax": "model.model_dump()",
       "required_imports": [],
-      "breaking_gotcha": "Symbol '.dict()' updated in pydantic 2.9.2. Check import path and argument signature.",
-      "source_url": "https://pypi.org/project/pydantic/1.10.12"
+      "breaking_gotcha": "model_dump() returns a dict by default; to obtain a JSON string use model_dump_json(). Parameters like exclude, include work similarly, but note that the default behavior excludes nothing.",
+      "source_url": "https://tomodahinata.com/en/blog/pydantic-v1-to-v2-migration-complete-guide"
     },
     {
       "symbol": ".json()",
-      "old_syntax": "# Legacy usage of .json()",
-      "new_syntax": "# Modern replacement for .json() in pydantic 2.9.2",
+      "old_syntax": "model.json()",
+      "new_syntax": "model.model_dump_json()",
       "required_imports": [],
-      "breaking_gotcha": "Symbol '.json()' updated in pydantic 2.9.2. Check import path and argument signature.",
-      "source_url": "https://pypi.org/project/pydantic/1.10.12"
+      "breaking_gotcha": "model_dump_json() returns a JSON string, equivalent to v1's json(). Arguments such as indent, exclude, and by_alias behave the same way.",
+      "source_url": "https://tomodahinata.com/en/blog/pydantic-v1-to-v2-migration-complete-guide"
     },
     {
-      "symbol": ".parse_obj()",
-      "old_syntax": "# Legacy usage of .parse_obj()",
-      "new_syntax": "# Modern replacement for .parse_obj() in pydantic 2.9.2",
+      "symbol": ".copy()",
+      "old_syntax": "model.copy(update={'field': value})",
+      "new_syntax": "model.model_copy(update={'field': value})",
       "required_imports": [],
-      "breaking_gotcha": "Symbol '.parse_obj()' updated in pydantic 2.9.2. Check import path and argument signature.",
-      "source_url": "https://pypi.org/project/pydantic/1.10.12"
+      "breaking_gotcha": "model_copy() performs a shallow merge of the update dict, matching v1 copy behavior. Deep copying is not provided; use copy.deepcopy() if needed.",
+      "source_url": "https://tomodahinata.com/en/blog/pydantic-v1-to-v2-migration-complete-guide"
     },
     {
-      "symbol": ".parse_raw()",
-      "old_syntax": "# Legacy usage of .parse_raw()",
-      "new_syntax": "# Modern replacement for .parse_raw() in pydantic 2.9.2",
+      "symbol": ".construct()",
+      "old_syntax": "MyModel.construct(field1=val1, field2=val2)",
+      "new_syntax": "MyModel.model_construct(field1=val1, field2=val2)",
       "required_imports": [],
-      "breaking_gotcha": "Symbol '.parse_raw()' updated in pydantic 2.9.2. Check import path and argument signature.",
-      "source_url": "https://pypi.org/project/pydantic/1.10.12"
+      "breaking_gotcha": "model_construct() creates an instance without running validation, identical to v1 construct. Use only with trusted data.",
+      "source_url": "https://tomodahinata.com/en/blog/pydantic-v1-to-v2-migration-complete-guide"
     },
     {
-      "symbol": ".schema_json()",
-      "old_syntax": "# Legacy usage of .schema_json()",
-      "new_syntax": "# Modern replacement for .schema_json() in pydantic 2.9.2",
-      "required_imports": [],
-      "breaking_gotcha": "Symbol '.schema_json()' updated in pydantic 2.9.2. Check import path and argument signature.",
-      "source_url": "https://pypi.org/project/pydantic/1.10.12"
+      "symbol": "@root_validator",
+      "old_syntax": "@root_validator\\ndef cls_validator(cls, values):\\n    # values is a dict of field values\\n    ...",
+      "new_syntax": "@model_validator(mode='after')\\ndef validator(self):\\n    # self is the model instance\\n    ...",
+      "required_imports": [
+        "from pydantic import model_validator"
+      ],
+      "breaking_gotcha": "In v2, mode='after' provides the model instance (self) rather than a dict of values. To access raw input data, use mode='before' and receive a dict, or inspect self.__dict__.",
+      "source_url": "https://tomodahinata.com/en/blog/pydantic-v1-to-v2-migration-complete-guide"
+    },
+    {
+      "symbol": "@root_validator(pre=True)",
+      "old_syntax": "@root_validator(pre=True)\\ndef cls_validator(cls, values):\\n    ...",
+      "new_syntax": "@model_validator(mode='before')\\ndef validator(cls, values):\\n    ...",
+      "required_imports": [
+        "from pydantic import model_validator"
+      ],
+      "breaking_gotcha": "mode='before' continues to receive a dict of raw input values, preserving the v1 pre=True behavior. No signature change is required.",
+      "source_url": "https://tomodahinata.com/en/blog/pydantic-v1-to-v2-migration-complete-guide"
+    },
+    {
+      "symbol": "@validator('field_name')",
+      "old_syntax": "@validator('field_name')\\ndef cls_validator(cls, v):\\n    ...",
+      "new_syntax": "@field_validator('field_name')\\ndef _validator(cls, v):\\n    ...",
+      "required_imports": [
+        "from pydantic import field_validator"
+      ],
+      "breaking_gotcha": "validator is renamed to field_validator. The each_item, always, config, and field arguments are removed; use Field(validate_default=True) for always-like behavior and annotate list elements for per-item validation.",
+      "source_url": "https://tomodahinata.com/en/blog/pydantic-v1-to-v2-migration-complete-guide"
+    },
+    {
+      "symbol": "AppSettings()",
+      "old_syntax": "from pydantic import BaseSettings\\nclass AppSettings(BaseSettings):\\n    ...\\nsettings = AppSettings()",
+      "new_syntax": "from pydantic_settings import BaseSettings\\nclass AppSettings(BaseSettings):\\n    ...\\nsettings = AppSettings()",
+      "required_imports": [
+        "from pydantic_settings import BaseSettings"
+      ],
+      "breaking_gotcha": "BaseSettings was moved to the separate pydantic-settings package. Install pydantic-settings and replace the import. Configuration via inner Config class is replaced with model_config = SettingsConfigDict(...).",
+      "source_url": "https://tomodahinata.com/en/blog/pydantic-v1-to-v2-migration-complete-guide"
     }
   ],
   "synthesized_by_model": "nvidia/nemotron-3-super-120b-a12b",
-  "generation_latency_ms": 18249.19,
+  "generation_latency_ms": 16030.29,
   "uncovered_symbols": [
-    "@root_validator",
-    "@root_validator(pre=True)",
+    ".as_openai_messages()",
+    ".parse_obj()",
+    ".parse_raw()",
+    ".schema_json()",
     "@root_validator(skip_on_failure=True)",
     "@validator('__root__', each_item=True)",
     "@validator('attempt_count')",
     "@validator('fx_rate', always=True)",
-    "AppSettings()",
     "BaseFinancialModel (Inheritance)",
     "BaseModel (Inheritance)",
     "BaseSettings (Inheritance)",

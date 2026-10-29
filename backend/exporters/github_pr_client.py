@@ -150,7 +150,7 @@ def create_migration_pr(
     token = github_token or os.getenv("GITHUB_TOKEN", "")
     is_draft = stage4_report.final_status != "PASSED"
 
-    if is_draft and skip_on_fail:
+    if is_draft and skip_on_fail and stage4_report.final_status != "NEEDS_MANUAL":
         print(f"[PR Client] Verification status is '{stage4_report.final_status}'. Skipping PR creation.")
         return None
 

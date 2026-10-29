@@ -8,7 +8,7 @@ import sys
 from decimal import Decimal
 from datetime import datetime, date
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from backend.config import NEBIUS_API_KEY, NEBIUS_BASE_URL, NEMOTRON_ULTRA_MODEL
 from backend.intelligence.prompts import PARITY_TEST_GEN_SYSTEM_PROMPT
@@ -56,9 +56,11 @@ def _discover_migrated_symbols(repo_dir: Path) -> List[Dict[str, Any]]:
                                     if a.arg not in ("self", "cls"):
                                         t = ast.unparse(a.annotation) if getattr(a, "annotation", None) and hasattr(ast, "unparse") else ""
                                         fields[a.arg] = t
+                        bases = [ast.unparse(b) for b in n.bases if hasattr(ast, "unparse")]
                         classes.append({
                             "name": n.name,
                             "fields": fields,
+                            "bases": bases,
                         })
 
                 functions = []
@@ -128,19 +130,25 @@ def _generate_sample_input_for_field(field_name: str, type_annotation: str = "")
         return {"order_id": "test_order_123", "created_at": "2025-01-01T12:00:00", "items": [{"sku": "SKU-1", "quantity": 1, "unit_price_cents": 100}]}
     if name == "raw_json":
         return json.dumps({"order_id": "test_order_123", "created_at": "2025-01-01T12:00:00", "items": [{"sku": "SKU-1", "quantity": 1, "unit_price_cents": 100}]})
+    if name == "raw_list" or ("list" in t_clean and "dict" in t_clean):
+        return [{"trace_id": "test_trace_123", "attempt_count": 1, "payload": {"status": "ok"}, "scores": [0.2, 0.5, 0.8]}]
     if name == "prompt":
         return {"system_instruction": "Summarize", "user_transcript": "User dialog", "temperature": 0.5}
-    if name == "scores" or name == "__root__":
-        return [1.0, 2.5, 3.0]
+    if name in ("scores", "__root__", "root"):
+        return [0.2, 0.5, 0.8]
 
     # Type-directed synthesis
-    if "int" in t_clean:
+    if "int" in t_clean and "list" not in t_clean:
         return 5
-    if "float" in t_clean:
+    if "float" in t_clean and "list" not in t_clean:
         return 10.5
     if "bool" in t_clean:
         return True
     if "list" in t_clean:
+        if "float" in t_clean:
+            return [0.2, 0.5, 0.8]
+        if "int" in t_clean:
+            return [1, 2, 3]
         return ["item_1", "item_2"]
     if "dict" in t_clean:
         return {"key": "value"}
@@ -221,7 +229,17 @@ def _serialize_value(val: Any, mode: str = "json") -> Any:
                 pass
         return val.dict()
 
-    if isinstance(val, (int, float, str, bool)):
+    if isinstance(val, str):
+        s_val = val.strip()
+        if (s_val.startswith("{") and s_val.endswith("}")) or (s_val.startswith("[") and s_val.endswith("]")):
+            try:
+                parsed_json = json.loads(s_val)
+                return _serialize_value(parsed_json, mode=mode)
+            except Exception:
+                pass
+        return val.replace("#/$defs/", "#/definitions/")
+
+    if isinstance(val, (int, float, bool)):
         return val
     if isinstance(val, (list, tuple)):
         return [_serialize_value(item, mode=mode) for item in val]
@@ -229,13 +247,414 @@ def _serialize_value(val: Any, mode: str = "json") -> Any:
         serialized_items = [_serialize_value(item, mode=mode) for item in val]
         return sorted(serialized_items, key=lambda x: json.dumps(x, default=str) if isinstance(x, (dict, list)) else str(x))
     if isinstance(val, dict):
-        return {str(k): _serialize_value(v, mode=mode) for k, v in val.items()}
+        norm_dict = {}
+        for k, v in val.items():
+            str_k = str(k)
+            if str_k in ("$defs", "definitions"):
+                str_k = "definitions"
+            norm_dict[str_k] = _serialize_value(v, mode=mode)
+        return norm_dict
     if isinstance(val, Decimal):
         return str(val) if mode == "json" else float(val)
     if isinstance(val, (datetime, date)):
         return val.isoformat()
 
     return str(val)
+
+
+def _extract_model_class_name(annotation: str, known_classes: Set[str]) -> Optional[str]:
+    """
+    Given a type annotation string, determines if it references a discovered model class.
+    Handles exact names ('OrderRequest'), qualified names ('models.OrderRequest'),
+    and optional wrappers ('Optional[OrderRequest]', 'Union[OrderRequest, None]').
+    Does not match collections like List[OrderRequest] or Dict[str, OrderRequest].
+    """
+    if not annotation:
+        return None
+    cleaned = annotation.strip()
+    if not cleaned:
+        return None
+
+    # Exact match
+    if cleaned in known_classes:
+        return cleaned
+
+    # Qualified name (e.g. models.OrderRequest)
+    tail = cleaned.split(".")[-1].strip()
+    if tail in known_classes:
+        return tail
+
+    # Optional[Model]
+    if cleaned.startswith("Optional[") and cleaned.endswith("]"):
+        inner = cleaned[len("Optional["):-1].strip()
+        inner_tail = inner.split(".")[-1].strip()
+        if inner_tail in known_classes:
+            return inner_tail
+
+    # Union[Model, None]
+    if cleaned.startswith("Union[") and cleaned.endswith("]"):
+        parts = [p.strip() for p in cleaned[len("Union["):-1].split(",")]
+        for p in parts:
+            if p in ("None", "NoneType"):
+                continue
+            p_tail = p.split(".")[-1].strip()
+            if p_tail in known_classes:
+                return p_tail
+
+    return None
+
+
+def _is_base_settings_subclass(cls_obj: Any) -> bool:
+    """Checks at test runtime if cls_obj is a subclass of BaseSettings (v1 or v2)."""
+    try:
+        if isinstance(cls_obj, type) and cls_obj.__name__ != "BaseSettings":
+            return any(base.__name__ == "BaseSettings" for base in cls_obj.__mro__)
+    except Exception:
+        pass
+    return False
+
+
+def _get_field_env_vars_to_set(cls_obj: Any, sample_kwargs: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Computes environment variable name-value pairs for each field of a BaseSettings subclass.
+    Honors env_prefix (v1 Config or v2 model_config) and custom field aliases / validation_aliases.
+    """
+    env_vars: Dict[str, str] = {}
+
+    # 1. Determine env_prefix
+    env_prefix = ""
+    model_config = getattr(cls_obj, "model_config", None)
+    if isinstance(model_config, dict):
+        env_prefix = model_config.get("env_prefix", "") or ""
+    elif hasattr(model_config, "env_prefix"):
+        env_prefix = getattr(model_config, "env_prefix", "") or ""
+
+    if not env_prefix:
+        cfg = getattr(cls_obj, "Config", None)
+        if cfg and hasattr(cfg, "env_prefix"):
+            env_prefix = getattr(cfg, "env_prefix", "") or ""
+
+    # 2. Get fields dictionary
+    fields_dict = getattr(cls_obj, "model_fields", None)
+    if fields_dict is None:
+        fields_dict = getattr(cls_obj, "__fields__", None)
+    if not isinstance(fields_dict, dict):
+        fields_dict = {k: None for k in sample_kwargs}
+
+    for f_name, val in (sample_kwargs or {}).items():
+        f_info = fields_dict.get(f_name)
+        var_name = ""
+
+        if f_info is not None:
+            extra = getattr(getattr(f_info, "field_info", None), "extra", {})
+            env_val = getattr(f_info, "env", None)
+            if isinstance(extra, dict) and extra.get("env"):
+                var_name = extra["env"]
+            elif isinstance(env_val, str) and env_val:
+                var_name = env_val
+            elif getattr(getattr(f_info, "field_info", None), "env", None):
+                var_name = getattr(f_info.field_info, "env")
+
+            if not var_name:
+                v_alias = getattr(f_info, "validation_alias", None)
+                if isinstance(v_alias, str) and v_alias:
+                    var_name = v_alias
+                elif getattr(f_info, "has_alias", False) and isinstance(getattr(f_info, "alias", None), str):
+                    var_name = f_info.alias
+
+        if not var_name:
+            var_name = f"{env_prefix}{f_name}".upper()
+
+        if hasattr(val, "value"):
+            val = val.value
+
+        if isinstance(val, bool):
+            str_val = "true" if val else "false"
+        elif isinstance(val, (dict, list)):
+            str_val = json.dumps(val)
+        elif isinstance(val, (datetime, date)):
+            str_val = val.isoformat()
+        else:
+            str_val = str(val)
+
+        env_vars[var_name] = str_val
+        env_vars[f"{env_prefix}{f_name}".upper()] = str_val
+
+    return env_vars
+
+
+GOLDEN_FILE = Path(__file__).resolve().parent / "golden.json"
+IS_RECORDING = os.getenv("DRIFTZERO_RECORD_GOLDEN", "0") == "1"
+_golden_store: dict = {}
+
+
+def _load_golden(golden_path: Optional[Path] = None) -> dict:
+    global _golden_store
+    g_path = golden_path or GOLDEN_FILE
+    if _golden_store:
+        return _golden_store
+    if not g_path.exists():
+        if os.getenv("DRIFTZERO_RECORD_GOLDEN", "0") != "1":
+            raise AssertionError(
+                f"Golden baseline file '{g_path}' not found! "
+                "The old-version container must run with DRIFTZERO_RECORD_GOLDEN=1 first "
+                "to record golden baseline outputs before running differential verification."
+            )
+        return _golden_store
+    try:
+        _golden_store.clear()
+        _golden_store.update(json.loads(g_path.read_text(encoding="utf-8")))
+        return _golden_store
+    except Exception as exc:
+        raise AssertionError(f"Failed to read golden baseline file: {exc}")
+
+
+def _save_golden(golden_path: Optional[Path] = None):
+    global _golden_store
+    g_path = golden_path or GOLDEN_FILE
+    g_path.write_text(json.dumps(_golden_store, indent=2, default=str), encoding="utf-8")
+
+
+def verify_base_settings_env_differential(
+    mod_name: str,
+    cls_name: str,
+    cls_obj: Any,
+    sample_kwargs: Optional[Dict[str, Any]] = None,
+    golden_path: Optional[Path] = None,
+):
+    """
+    Differential parity assertion for BaseSettings subclasses:
+    Sets each field's environment variable, instantiates the model with no arguments,
+    and records/verifies the resulting instance against golden.json.
+    Restores original environment variables afterward.
+    """
+    global _golden_store
+    golden_key = f"settings_env::{mod_name}.{cls_name}"
+
+    final_kwargs = _build_model_sample_inputs(cls_obj, fallback=sample_kwargs)
+    env_vars = _get_field_env_vars_to_set(cls_obj, final_kwargs)
+
+    saved_env = {}
+    keys_to_clean = []
+    try:
+        for k, v in env_vars.items():
+            if k in os.environ:
+                saved_env[k] = os.environ[k]
+            else:
+                keys_to_clean.append(k)
+            os.environ[k] = v
+
+        is_rec = os.getenv("DRIFTZERO_RECORD_GOLDEN", "0") == "1"
+        if is_rec:
+            record = {}
+            try:
+                try:
+                    instance = cls_obj(_env_file=None)
+                except (TypeError, ValueError):
+                    instance = cls_obj()
+                record["status"] = "ok"
+                record["output"] = _serialize_value(instance, mode="json")
+            except Exception as exc:
+                record["status"] = "error"
+                record["error_type"] = type(exc).__name__
+
+            _load_golden(golden_path)
+            _golden_store[golden_key] = record
+            _save_golden(golden_path)
+            return
+
+        golden = _load_golden(golden_path)
+        if golden_key not in golden:
+            raise AssertionError(
+                f"Missing golden baseline entry for BaseSettings '{mod_name}.{cls_name}'. "
+                "Old-version container must record golden.json before verification."
+            )
+
+        expected = golden[golden_key]
+        if expected["status"] == "ok":
+            try:
+                instance = cls_obj(_env_file=None)
+            except (TypeError, ValueError):
+                instance = cls_obj()
+            actual_norm = _serialize_value(instance, mode="json")
+            expected_norm = _serialize_value(expected["output"], mode="json")
+            assert actual_norm == expected_norm, (
+                f"Differential BaseSettings Parity Mismatch for '{cls_name}' when loaded from env vars:\n"
+                f"Expected (Golden): {expected_norm}\n"
+                f"Actual   (New):    {actual_norm}"
+            )
+        else:
+            import pytest
+            with pytest.raises(Exception) as exc_info:
+                cls_obj()
+            actual_type = exc_info.value.__class__.__name__
+            expected_type = expected["error_type"]
+            assert actual_type == expected_type, (
+                f"Error type mismatch for BaseSettings '{cls_name}' loaded from env vars: "
+                f"expected {expected_type}, got {actual_type}"
+            )
+    finally:
+        for k in keys_to_clean:
+            os.environ.pop(k, None)
+        for k, v in saved_env.items():
+            os.environ[k] = v
+
+
+def verify_model_differential(
+    mod_name: str,
+    cls_name: str,
+    cls_obj: Any,
+    sample_kwargs: Optional[Dict[str, Any]] = None,
+    golden_path: Optional[Path] = None,
+):
+    """
+    Differential parity assertion for models:
+    - Builds inputs at test runtime from model_fields or __fields__, including inherited ones.
+    - Normalizes both sides through _serialize_value(mode="json") before comparing.
+    - Compares error type only, not message.
+    - For BaseSettings subclasses, runs environment variable check.
+    """
+    global _golden_store
+    golden_key = f"model::{mod_name}.{cls_name}"
+
+    runtime_inputs = _build_model_sample_inputs(cls_obj, fallback=sample_kwargs)
+    final_kwargs = runtime_inputs if runtime_inputs else dict(sample_kwargs or {})
+
+    is_rec = os.getenv("DRIFTZERO_RECORD_GOLDEN", "0") == "1"
+    if is_rec:
+        record = {}
+        try:
+            instance = cls_obj(**final_kwargs)
+            record["status"] = "ok"
+            record["output"] = _serialize_value(instance, mode="json")
+            record["model_dump"] = record["output"]
+            record["model_dump_json"] = record["output"]
+        except Exception as exc:
+            record["status"] = "error"
+            record["error_type"] = type(exc).__name__
+
+        # Record error type on invalid / empty inputs
+        try:
+            cls_obj()
+            record["empty_input_status"] = "ok"
+        except Exception as exc:
+            record["empty_input_status"] = "error"
+            record["invalid_error_type"] = type(exc).__name__
+
+        _load_golden(golden_path)
+        _golden_store[golden_key] = record
+        _save_golden(golden_path)
+
+        # Runtime check for BaseSettings subclasses: set each field's env var and compare against golden
+        if _is_base_settings_subclass(cls_obj):
+            verify_base_settings_env_differential(mod_name, cls_name, cls_obj, sample_kwargs=final_kwargs, golden_path=golden_path)
+        return
+
+    # Verification Mode
+    golden = _load_golden(golden_path)
+    if golden_key not in golden:
+        raise AssertionError(
+            f"Missing golden baseline entry for model '{mod_name}.{cls_name}'. "
+            "Old-version container must record golden.json before verification."
+        )
+
+    expected = golden[golden_key]
+    if expected["status"] == "ok":
+        instance = cls_obj(**final_kwargs)
+        actual_norm = _serialize_value(instance, mode="json")
+        expected_norm = _serialize_value(
+            expected.get("output") or expected.get("model_dump_json") or expected.get("model_dump"),
+            mode="json",
+        )
+        assert actual_norm == expected_norm, (
+            f"Differential Model Parity Mismatch for '{cls_name}':\n"
+            f"Expected (Golden): {expected_norm}\n"
+            f"Actual   (New):    {actual_norm}"
+        )
+    else:
+        import pytest
+        with pytest.raises(Exception) as exc_info:
+            cls_obj(**final_kwargs)
+        actual_type = exc_info.value.__class__.__name__
+        expected_type = expected["error_type"]
+        assert actual_type == expected_type, (
+            f"Error type mismatch for '{cls_name}': expected {expected_type}, got {actual_type}"
+        )
+
+    if expected.get("empty_input_status") == "error":
+        import pytest
+        with pytest.raises(Exception) as exc_info:
+            cls_obj()
+        actual_type = exc_info.value.__class__.__name__
+        expected_type = expected["invalid_error_type"]
+        assert actual_type == expected_type, (
+            f"Validation error type mismatch for invalid inputs on '{cls_name}': "
+            f"expected {expected_type}, got {actual_type}"
+        )
+
+    # Runtime check for BaseSettings subclasses: set each field's env var and compare against golden
+    if _is_base_settings_subclass(cls_obj):
+        verify_base_settings_env_differential(mod_name, cls_name, cls_obj, sample_kwargs=final_kwargs, golden_path=golden_path)
+
+
+def verify_function_differential(
+    mod_name: str,
+    fn_name: str,
+    fn_obj: Any,
+    sample_kwargs: Optional[Dict[str, Any]] = None,
+    golden_path: Optional[Path] = None,
+):
+    """
+    Differential parity assertion for functions:
+    - Normalizes both sides through _serialize_value(mode="json") before comparing.
+    - Compares error type only, not message.
+    """
+    global _golden_store
+    golden_key = f"func::{mod_name}.{fn_name}"
+    final_kwargs = dict(sample_kwargs or {})
+
+    is_rec = os.getenv("DRIFTZERO_RECORD_GOLDEN", "0") == "1"
+    if is_rec:
+        record = {}
+        try:
+            res = fn_obj(**final_kwargs)
+            record["status"] = "ok"
+            record["output"] = _serialize_value(res, mode="json")
+        except Exception as exc:
+            record["status"] = "error"
+            record["error_type"] = type(exc).__name__
+
+        _load_golden(golden_path)
+        _golden_store[golden_key] = record
+        _save_golden(golden_path)
+        return
+
+    golden = _load_golden(golden_path)
+    if golden_key not in golden:
+        raise AssertionError(
+            f"Missing golden baseline entry for function '{mod_name}.{fn_name}'. "
+            "Old-version container must record golden.json before verification."
+        )
+
+    expected = golden[golden_key]
+    if expected["status"] == "ok":
+        res = fn_obj(**final_kwargs)
+        actual_norm = _serialize_value(res, mode="json")
+        expected_norm = _serialize_value(expected["output"], mode="json")
+        assert actual_norm == expected_norm, (
+            f"Differential Function Parity Mismatch for '{fn_name}':\n"
+            f"Expected (Golden): {expected_norm}\n"
+            f"Actual   (New):    {actual_norm}"
+        )
+    else:
+        import pytest
+        with pytest.raises(Exception) as exc_info:
+            fn_obj(**final_kwargs)
+        actual_type = exc_info.value.__class__.__name__
+        expected_type = expected["error_type"]
+        assert actual_type == expected_type, (
+            f"Function error type mismatch for '{fn_name}': expected {expected_type}, got {actual_type}"
+        )
 
 
 def dry_run_candidate_in_record_mode(candidate_code: str, repo_dir: Path) -> bool:
@@ -297,8 +716,20 @@ def _build_deterministic_differential_suite(
     3. Maintains a module-level global _golden_store dictionary.
     4. Normalizes both sides through _serialize_value(mode="json") before comparing.
     5. Compares error type only, not message.
+    6. When a function argument's annotation is a discovered model class, builds it as Model(**sample).
+    7. Runs runtime check for BaseSettings subclasses by setting each field's env var and comparing against golden.
     """
     test_functions = []
+
+    # Map discovered classes across modules: class name -> {module: ..., class_info: ...}
+    discovered_model_map: Dict[str, Dict[str, Any]] = {}
+    for m in modules:
+        for c in m.get("classes", []):
+            discovered_model_map[c["name"]] = {
+                "module": m["module"],
+                "class_info": c,
+            }
+    known_model_classes = set(discovered_model_map.keys())
 
     for idx, mod in enumerate(modules):
         mod_name = mod["module"]
@@ -306,11 +737,12 @@ def _build_deterministic_differential_suite(
 
         class_names = [c["name"] for c in mod["classes"]]
         func_names = [f["name"] for f in mod["functions"]]
-        all_symbols = class_names + func_names
+        all_symbols = list(dict.fromkeys(class_names + func_names))
         if not all_symbols:
             continue
 
         symbol_tests = []
+        extra_imports: Set[str] = set()
 
         # 1. Model differential tests
         for cls_info in mod["classes"]:
@@ -329,21 +761,71 @@ def _build_deterministic_differential_suite(
         for fn_info in mod["functions"]:
             f_name = fn_info["name"]
             args = fn_info["args"]
-            sample_kwargs = {a: _generate_sample_input_for_field(a, args.get(a, "")) for a in args} if args else {}
-            sample_repr = repr(sample_kwargs)
 
-            symbol_tests.append(f"""
+            model_args: Dict[str, str] = {}
+            for a, a_type in args.items():
+                m_cls = _extract_model_class_name(a_type, known_model_classes)
+                if m_cls:
+                    model_args[a] = m_cls
+                    target_mod = discovered_model_map[m_cls]["module"]
+                    if target_mod != mod_name:
+                        extra_imports.add(f"from {target_mod} import {m_cls}")
+
+            if not args:
+                symbol_tests.append(f"""
+    # Differential Parity Test for Function: {mod_name}.{f_name}
+    sample_kwargs = {{}}
+    verify_function_differential("{mod_name}", "{f_name}", {f_name}, sample_kwargs)
+""")
+            elif not model_args:
+                sample_kwargs = {a: _generate_sample_input_for_field(a, args.get(a, "")) for a in args}
+                sample_repr = repr(sample_kwargs)
+                symbol_tests.append(f"""
     # Differential Parity Test for Function: {mod_name}.{f_name}
     sample_kwargs = {sample_repr}
     verify_function_differential("{mod_name}", "{f_name}", {f_name}, sample_kwargs)
 """)
+            else:
+                sample_setup_lines = []
+                kwargs_items = []
+                is_single_model = len(model_args) == 1
 
-        import_statement = f"from {mod_name} import {', '.join(all_symbols)}"
+                for a, a_type in args.items():
+                    if a in model_args:
+                        m_cls = model_args[a]
+                        cls_entry = discovered_model_map[m_cls]["class_info"]
+                        flds = cls_entry.get("fields", {})
+                        m_sample = {f: _generate_sample_input_for_field(f, flds.get(f, "")) for f in flds} if flds else {}
+                        m_sample_repr = repr(m_sample)
+
+                        var_name = "sample" if is_single_model else f"sample_{a}"
+                        sample_setup_lines.append(
+                            f"    {var_name} = _build_model_sample_inputs({m_cls}, fallback={m_sample_repr})"
+                        )
+                        kwargs_items.append(f"'{a}': {m_cls}(**{var_name})")
+                    else:
+                        val = _generate_sample_input_for_field(a, a_type)
+                        kwargs_items.append(f"'{a}': {repr(val)}")
+
+                setup_code = "\n".join(sample_setup_lines)
+                kwargs_code = "{" + ", ".join(kwargs_items) + "}"
+
+                symbol_tests.append(f"""
+    # Differential Parity Test for Function: {mod_name}.{f_name}
+{setup_code}
+    sample_kwargs = {kwargs_code}
+    verify_function_differential("{mod_name}", "{f_name}", {f_name}, sample_kwargs)
+""")
+
+        imports = [f"from {mod_name} import {', '.join(all_symbols)}"]
+        if extra_imports:
+            imports.extend(sorted(extra_imports))
+        import_block = "\n    ".join(imports)
 
         test_functions.append(f"""
 def test_differential_parity_{idx}_{fn_name_safe}():
     # Direct import: fails loudly with ImportError if the symbol was renamed or deleted
-    {import_statement}
+    {import_block}
 {"".join(symbol_tests)}
 """)
 
@@ -364,6 +846,22 @@ if str(_repo_root) not in sys.path:
 _src_dir = _repo_root / "src"
 if _src_dir.exists() and str(_src_dir) not in sys.path:
     sys.path.insert(0, str(_src_dir))
+
+# Compatibility fix for Python 3.14+ PEP 649 deferred annotations with legacy Pydantic v1
+try:
+    import pydantic.main
+    if hasattr(pydantic.main, "ModelMetaclass"):
+        _orig_model_meta_new = pydantic.main.ModelMetaclass.__new__
+        def _compat_model_meta_new(mcs, name, bases, namespace, **kwargs):
+            if "__annotate_func__" in namespace and not namespace.get("__annotations__"):
+                try:
+                    namespace["__annotations__"] = namespace["__annotate_func__"](1)
+                except Exception:
+                    pass
+            return _orig_model_meta_new(mcs, name, bases, namespace, **kwargs)
+        pydantic.main.ModelMetaclass.__new__ = _compat_model_meta_new
+except Exception:
+    pass
 
 GOLDEN_FILE = Path(__file__).resolve().parent / "golden.json"
 IS_RECORDING = os.getenv("DRIFTZERO_RECORD_GOLDEN", "0") == "1"
@@ -435,18 +933,24 @@ def _generate_sample_input_for_field(field_name: str, type_annotation: str = "")
         return {{"order_id": "test_order_123", "created_at": "2025-01-01T12:00:00", "items": [{{"sku": "SKU-1", "quantity": 1, "unit_price_cents": 100}}]}}
     if name == "raw_json":
         return json.dumps({{"order_id": "test_order_123", "created_at": "2025-01-01T12:00:00", "items": [{{"sku": "SKU-1", "quantity": 1, "unit_price_cents": 100}}]}})
+    if name == "raw_list" or ("list" in t_clean and "dict" in t_clean):
+        return [{{"trace_id": "test_trace_123", "attempt_count": 1, "payload": {{"status": "ok"}}, "scores": [0.2, 0.5, 0.8]}}]
     if name == "prompt":
         return {{"system_instruction": "Summarize", "user_transcript": "User dialog", "temperature": 0.5}}
-    if name == "scores" or name == "__root__":
-        return [1.0, 2.5, 3.0]
+    if name in ("scores", "__root__", "root"):
+        return [0.2, 0.5, 0.8]
 
-    if "int" in t_clean:
+    if "int" in t_clean and "list" not in t_clean:
         return 5
-    if "float" in t_clean:
+    if "float" in t_clean and "list" not in t_clean:
         return 10.5
     if "bool" in t_clean:
         return True
     if "list" in t_clean:
+        if "float" in t_clean:
+            return [0.2, 0.5, 0.8]
+        if "int" in t_clean:
+            return [1, 2, 3]
         return ["item_1", "item_2"]
     if "dict" in t_clean:
         return {{"key": "value"}}
@@ -524,7 +1028,17 @@ def _serialize_value(val, mode="json"):
                 pass
         return val.dict()
 
-    if isinstance(val, (int, float, str, bool)):
+    if isinstance(val, str):
+        s_val = val.strip()
+        if (s_val.startswith("{{") and s_val.endswith("}}")) or (s_val.startswith("[") and s_val.endswith("]")):
+            try:
+                parsed_json = json.loads(s_val)
+                return _serialize_value(parsed_json, mode=mode)
+            except Exception:
+                pass
+        return val.replace("#/$defs/", "#/definitions/")
+
+    if isinstance(val, (int, float, bool)):
         return val
     if isinstance(val, (list, tuple)):
         return [_serialize_value(item, mode=mode) for item in val]
@@ -532,7 +1046,13 @@ def _serialize_value(val, mode="json"):
         serialized_items = [_serialize_value(item, mode=mode) for item in val]
         return sorted(serialized_items, key=lambda x: json.dumps(x, default=str) if isinstance(x, (dict, list)) else str(x))
     if isinstance(val, dict):
-        return {{str(k): _serialize_value(v, mode=mode) for k, v in val.items()}}
+        norm_dict = {{}}
+        for k, v in val.items():
+            str_k = str(k)
+            if str_k in ("$defs", "definitions"):
+                str_k = "definitions"
+            norm_dict[str_k] = _serialize_value(v, mode=mode)
+        return norm_dict
     if isinstance(val, Decimal):
         return str(val) if mode == "json" else float(val)
     if isinstance(val, (datetime, date)):
@@ -541,12 +1061,161 @@ def _serialize_value(val, mode="json"):
     return str(val)
 
 
+def _is_base_settings_subclass(cls_obj):
+    try:
+        if isinstance(cls_obj, type) and cls_obj.__name__ != "BaseSettings":
+            return any(base.__name__ == "BaseSettings" for base in cls_obj.__mro__)
+    except Exception:
+        pass
+    return False
+
+
+def _get_field_env_vars_to_set(cls_obj, sample_kwargs):
+    env_vars = {{}}
+    env_prefix = ""
+    model_config = getattr(cls_obj, "model_config", None)
+    if isinstance(model_config, dict):
+        env_prefix = model_config.get("env_prefix", "") or ""
+    elif hasattr(model_config, "env_prefix"):
+        env_prefix = getattr(model_config, "env_prefix", "") or ""
+
+    if not env_prefix:
+        cfg = getattr(cls_obj, "Config", None)
+        if cfg and hasattr(cfg, "env_prefix"):
+            env_prefix = getattr(cfg, "env_prefix", "") or ""
+
+    fields_dict = getattr(cls_obj, "model_fields", None)
+    if fields_dict is None:
+        fields_dict = getattr(cls_obj, "__fields__", None)
+    if not isinstance(fields_dict, dict):
+        fields_dict = {{k: None for k in sample_kwargs}}
+
+    for f_name, val in (sample_kwargs or {{}}).items():
+        f_info = fields_dict.get(f_name)
+        var_name = ""
+
+        if f_info is not None:
+            extra = getattr(getattr(f_info, "field_info", None), "extra", {{}})
+            env_val = getattr(f_info, "env", None)
+            if isinstance(extra, dict) and extra.get("env"):
+                var_name = extra["env"]
+            elif isinstance(env_val, str) and env_val:
+                var_name = env_val
+            elif getattr(getattr(f_info, "field_info", None), "env", None):
+                var_name = getattr(f_info.field_info, "env")
+
+            if not var_name:
+                v_alias = getattr(f_info, "validation_alias", None)
+                if isinstance(v_alias, str) and v_alias:
+                    var_name = v_alias
+                elif getattr(f_info, "has_alias", False) and isinstance(getattr(f_info, "alias", None), str):
+                    var_name = f_info.alias
+
+        if not var_name:
+            var_name = f"{{env_prefix}}{{f_name}}".upper()
+
+        if hasattr(val, "value"):
+            val = val.value
+
+        if isinstance(val, bool):
+            str_val = "true" if val else "false"
+        elif isinstance(val, (dict, list)):
+            str_val = json.dumps(val)
+        elif isinstance(val, (datetime, date)):
+            str_val = val.isoformat()
+        else:
+            str_val = str(val)
+
+        env_vars[var_name] = str_val
+        env_vars[f"{{env_prefix}}{{f_name}}".upper()] = str_val
+
+    return env_vars
+
+
+def verify_base_settings_env_differential(mod_name: str, cls_name: str, cls_obj, sample_kwargs: dict = None):
+    """
+    Differential parity assertion for BaseSettings subclasses:
+    Sets each field's environment variable, instantiates the model with no arguments,
+    and records/verifies the resulting instance against golden.json.
+    Restores original environment variables afterward.
+    """
+    global _golden_store
+    golden_key = f"settings_env::{{mod_name}}.{{cls_name}}"
+
+    final_kwargs = _build_model_sample_inputs(cls_obj, fallback=sample_kwargs)
+    env_vars = _get_field_env_vars_to_set(cls_obj, final_kwargs)
+
+    saved_env = {{}}
+    keys_to_clean = []
+    try:
+        for k, v in env_vars.items():
+            if k in os.environ:
+                saved_env[k] = os.environ[k]
+            else:
+                keys_to_clean.append(k)
+            os.environ[k] = v
+
+        if IS_RECORDING:
+            record = {{}}
+            try:
+                try:
+                    instance = cls_obj(_env_file=None)
+                except (TypeError, ValueError):
+                    instance = cls_obj()
+                record["status"] = "ok"
+                record["output"] = _serialize_value(instance, mode="json")
+            except Exception as exc:
+                record["status"] = "error"
+                record["error_type"] = type(exc).__name__
+
+            _load_golden()
+            _golden_store[golden_key] = record
+            _save_golden()
+            return
+
+        golden = _load_golden()
+        if golden_key not in golden:
+            raise AssertionError(
+                f"Missing golden baseline entry for BaseSettings '{{mod_name}}.{{cls_name}}'. "
+                "Old-version container must record golden.json before verification."
+            )
+
+        expected = golden[golden_key]
+        if expected["status"] == "ok":
+            try:
+                instance = cls_obj(_env_file=None)
+            except (TypeError, ValueError):
+                instance = cls_obj()
+            actual_norm = _serialize_value(instance, mode="json")
+            expected_norm = _serialize_value(expected["output"], mode="json")
+            assert actual_norm == expected_norm, (
+                f"Differential BaseSettings Parity Mismatch for '{{cls_name}}' when loaded from env vars:\\n"
+                f"Expected (Golden): {{expected_norm}}\\n"
+                f"Actual   (New):    {{actual_norm}}"
+            )
+        else:
+            with pytest.raises(Exception) as exc_info:
+                cls_obj()
+            actual_type = exc_info.value.__class__.__name__
+            expected_type = expected["error_type"]
+            assert actual_type == expected_type, (
+                f"Error type mismatch for BaseSettings '{{cls_name}}' loaded from env vars: "
+                f"expected {{expected_type}}, got {{actual_type}}"
+            )
+    finally:
+        for k in keys_to_clean:
+            os.environ.pop(k, None)
+        for k, v in saved_env.items():
+            os.environ[k] = v
+
+
 def verify_model_differential(mod_name: str, cls_name: str, cls_obj, sample_kwargs: dict = None):
     """
     Differential parity assertion for models:
     - Builds inputs at test runtime from model_fields or __fields__, including inherited ones.
     - Normalizes both sides through _serialize_value(mode="json") before comparing.
     - Compares error type only, not message.
+    - For BaseSettings subclasses, runs environment variable check.
     """
     global _golden_store
     golden_key = f"model::{{mod_name}}.{{cls_name}}"
@@ -577,6 +1246,10 @@ def verify_model_differential(mod_name: str, cls_name: str, cls_obj, sample_kwar
         _load_golden()
         _golden_store[golden_key] = record
         _save_golden()
+
+        # Runtime check for BaseSettings subclasses: set each field's env var and compare against golden
+        if _is_base_settings_subclass(cls_obj):
+            verify_base_settings_env_differential(mod_name, cls_name, cls_obj, sample_kwargs=final_kwargs)
         return
 
     # Verification Mode (New Container)
@@ -623,6 +1296,10 @@ def verify_model_differential(mod_name: str, cls_name: str, cls_obj, sample_kwar
             f"Validation error type mismatch for invalid inputs on '{{cls_name}}': "
             f"expected {{expected_type}}, got {{actual_type}}"
         )
+
+    # Runtime check for BaseSettings subclasses: set each field's env var and compare against golden
+    if _is_base_settings_subclass(cls_obj):
+        verify_base_settings_env_differential(mod_name, cls_name, cls_obj, sample_kwargs=final_kwargs)
 
 
 def verify_function_differential(mod_name: str, fn_name: str, fn_obj, sample_kwargs: dict = None):

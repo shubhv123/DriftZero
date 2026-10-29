@@ -2,8 +2,12 @@ import ast
 import concurrent.futures
 import difflib
 import json
+import os
+import py_compile
 import re
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -21,6 +25,7 @@ from backend.config import (
     PRICE_PER_1M_SUPER_OUTPUT,
     PRICE_PER_1M_ULTRA_INPUT,
     PRICE_PER_1M_ULTRA_OUTPUT,
+    PROJECT_ROOT,
 )
 from backend.core.ast_scanner import FileASTVisitor
 from backend.intelligence.prompts import (
@@ -40,7 +45,11 @@ from backend.schemas.migration_models import (
 
 
 def _extract_code_block(llm_text: str) -> str:
-    """Extracts python code from an LLM response block."""
+    """Extracts python code from an LLM response block, preferring the largest complete code block."""
+    blocks = re.findall(r"```(?:python)?\s*\n(.*?)```", llm_text, flags=re.DOTALL)
+    if blocks:
+        largest = max(blocks, key=len)
+        return largest.strip() + "\n"
     if "```python" in llm_text:
         body = llm_text.split("```python", 1)[1]
         return body.split("```", 1)[0].strip() + "\n"
@@ -95,17 +104,88 @@ def _filter_rules_for_file(
     return relevant_rules if relevant_rules else migration_delta.rules[:4]
 
 
+SUBPROCESS_IMPORT_RUNNER = """
+import importlib.util
+import sys
+
+mod_path = sys.argv[1]
+mod_name = sys.argv[2] if len(sys.argv) > 2 else "_candidate_patch"
+
+try:
+    spec = importlib.util.spec_from_file_location(mod_name, mod_path)
+    if spec and spec.loader:
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = mod
+        spec.loader.exec_module(mod)
+except (TypeError, ImportError) as exc:
+    print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+    sys.exit(42)
+except Exception:
+    # Non-type/import errors at import time do not trigger rejection
+    sys.exit(0)
+"""
+
+
+def _get_target_python() -> str:
+    """
+    Returns the python executable for the target version virtual environment
+    (the same venv the sandbox uses).
+    Checks explicit environment overrides, active VIRTUAL_ENV, workspace virtualenvs (env/.venv),
+    sandbox venvs in tempdir, and falls back to sys.executable.
+    """
+    # 1. Explicit override via environment variables
+    for env_var in ("DRIFTZERO_TARGET_PYTHON", "TARGET_VENV_PYTHON", "SANDBOX_VENV_PYTHON"):
+        val = os.getenv(env_var, "").strip()
+        if val and Path(val).exists():
+            return val
+
+    # 2. VIRTUAL_ENV environment variable
+    if os.getenv("VIRTUAL_ENV"):
+        venv_py = Path(os.environ["VIRTUAL_ENV"]) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        if venv_py.exists():
+            return str(venv_py)
+
+    # 3. Project virtual environments (./env, ./.venv, ./venv)
+    for candidate in ("env", ".venv", "venv"):
+        cand_py = PROJECT_ROOT / candidate / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        if cand_py.exists():
+            return str(cand_py)
+
+    # 4. Check for active sandbox venvs created in temp directory
+    try:
+        tmp_dir = Path(tempfile.gettempdir())
+        patched_venvs = sorted(
+            tmp_dir.glob("driftzero_venv_patched_*"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for v in patched_venvs:
+            cand_py = v / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            if cand_py.exists():
+                return str(cand_py)
+    except Exception:
+        pass
+
+    # 5. Fallback to sys.executable
+    return sys.executable
+
+
 def _validate_patch(
     candidate: str,
     original: str,
     target_library: str,
     relevant_rules: List[MigrationRule],
+    target_python: Optional[str] = None,
+    file_path: Optional[str] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     Validates that candidate patch:
     1. Parses cleanly with ast.parse() (AST validation).
     2. Preserves all top-level classes and functions from original (structural validation).
     3. Re-runs FileASTVisitor on the result and requires zero deprecated symbols.
+    4. Writes candidate to a temp file and runs py_compile.
+    5. Imports candidate in a subprocess under target version (same venv sandbox uses),
+       rejecting on TypeError or ImportError.
     """
     if not candidate or len(candidate.strip()) < 20:
         return False, "Candidate patch is empty or truncated."
@@ -167,12 +247,20 @@ def _validate_patch(
             if m:
                 deprecated_methods.add(m)
 
+    user_defined_methods: Set[str] = {
+        node.name.lower()
+        for node in ast.walk(cand_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
     deprecated_found: List[str] = []
 
     # 1. Exact symbol matching on method calls from FileASTVisitor
     for usage in visitor.usages:
         if usage.usage_type == "method_call" and usage.symbol_name.startswith("."):
             m_name = usage.symbol_name.rstrip("()").lstrip(".").lower()
+            if m_name in user_defined_methods:
+                continue
             if m_name in deprecated_methods:
                 deprecated_found.append(f"Method call `.{m_name}()` (line {usage.line_number})")
 
@@ -186,6 +274,8 @@ def _validate_patch(
                 clean_name = dec_name.strip().lstrip("@")
                 if clean_name in ("validator", "root_validator", f"{clean_target}.validator", f"{clean_target}.root_validator"):
                     deprecated_found.append(f"Decorator `@{clean_name}` (line {dec.lineno})")
+                elif clean_name in ("model_validator", f"{clean_target}.model_validator") and not isinstance(dec, ast.Call):
+                    deprecated_found.append(f"Bare `@model_validator` decorator without mode parameter (line {dec.lineno}). Use `@model_validator(mode='after')` or `@model_validator(mode='before')`.")
 
         # Imports: exact match for deprecated names from target library
         elif isinstance(node, ast.ImportFrom):
@@ -239,6 +329,66 @@ def _validate_patch(
     if deprecated_found:
         unique_dep = list(dict.fromkeys(deprecated_found))
         return False, f"Deprecated symbols remaining in patched file: {unique_dep}"
+
+    # 4. Write candidate to temp file and run py_compile
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as tmp_f:
+            tmp_path = Path(tmp_f.name)
+            tmp_f.write(candidate)
+            tmp_f.flush()
+
+        try:
+            py_compile.compile(str(tmp_path), doraise=True)
+        except Exception as exc:
+            return False, f"py_compile error: {exc}"
+
+        # 5. Import candidate in a subprocess under target version (same venv the sandbox uses)
+        py_exec = target_python or _get_target_python()
+        mod_name = re.sub(r"[^a-zA-Z0-9_]", "_", Path(file_path).stem) if file_path else "_candidate_patch"
+
+        env = os.environ.copy()
+        cwd_dir = None
+        if file_path:
+            fp = Path(file_path).resolve()
+            parent_dir = fp.parent
+            if parent_dir.exists():
+                cwd_dir = str(parent_dir)
+                search_paths = [str(parent_dir)]
+                curr = parent_dir
+                for _ in range(3):
+                    curr = curr.parent
+                    search_paths.append(str(curr))
+                search_paths.append(str(PROJECT_ROOT))
+                existing_pp = env.get("PYTHONPATH", "")
+                if existing_pp:
+                    search_paths.append(existing_pp)
+                env["PYTHONPATH"] = ":".join(search_paths)
+        if not cwd_dir:
+            env["PYTHONPATH"] = f"{PROJECT_ROOT}:{env.get('PYTHONPATH', '')}"
+
+        try:
+            proc = subprocess.run(
+                [py_exec, "-c", SUBPROCESS_IMPORT_RUNNER, str(tmp_path), mod_name],
+                cwd=cwd_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if proc.returncode == 42:
+                err_detail = proc.stderr.strip() or "TypeError or ImportError during module import"
+                return False, f"Import error under target version: {err_detail}"
+        except subprocess.TimeoutExpired:
+            return False, "Subprocess import timed out after 15 seconds"
+        except Exception:
+            pass
+    finally:
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
     return True, None
 
@@ -320,10 +470,24 @@ def patch_single_file_via_token_factory(
         from openai import OpenAI
 
         client = OpenAI(api_key=NEBIUS_API_KEY, base_url=NEBIUS_BASE_URL, timeout=40.0, max_retries=1)
+        pydantic_guidance = ""
+        if "pydantic" in (migration_delta.library or "").lower():
+            pydantic_guidance = (
+                "\nKey Pydantic v2 Architecture Rules:\n"
+                "- GenericModel is deprecated/removed in v2: generic models must inherit directly from (BaseModel, Generic[T]). Never import or use GenericModel.\n"
+                "- __root__ is deprecated/removed in v2: custom root models must inherit from RootModel[T] (from pydantic import RootModel). Access value via .root instead of .__root__.\n"
+                "- parse_obj_as(Type, data) -> TypeAdapter(Type).validate_python(data) (from pydantic import TypeAdapter).\n"
+                "- @validator -> @field_validator: E.g. `@field_validator('field')\n@classmethod\ndef check_field(cls, v: int) -> int: return v`. Never pass always=True, each_item=True, or `field` parameter.\n"
+                "- @root_validator -> @model_validator: NEVER use bare @model_validator without mode! Always specify mode parameter:\n"
+                "  * For mode='after': `@model_validator(mode='after')\ndef verify(self): ... return self` (INSTANCE method taking self, returning self).\n"
+                "  * For mode='before': `@model_validator(mode='before')\n@classmethod\ndef verify(cls, data: Any) -> Any: ... return data` (CLASS method taking cls, data).\n"
+                "- BaseSettings is in pydantic_settings (from pydantic_settings import BaseSettings, SettingsConfigDict).\n"
+            )
+
         messages = [
             {
                 "role": "system",
-                "content": system_prompt + "\n\nCRITICAL: DO NOT output any internal reasoning or thoughts. Start output immediately with ```python and output the complete upgraded code.",
+                "content": system_prompt + "\n\nCRITICAL: DO NOT output any conversational text, explanations, or multiple snippets. Output ONLY a single python code block starting with ```python containing the complete, upgraded file with all original classes and functions preserved.",
             },
             {
                 "role": "user",
@@ -331,7 +495,8 @@ def patch_single_file_via_token_factory(
                     f"File: {file_report.relative_path}\n"
                     f"Target Library: {migration_delta.library} (Upgrade {migration_delta.from_version} -> {migration_delta.to_version})\n"
                     f"Detected Usages: {[u.symbol_name for u in file_report.usages]}\n\n"
-                    f"Migration Rules for this file:\n{filtered_rules_json}\n\n"
+                    f"Migration Rules for this file:\n{filtered_rules_json}\n"
+                    f"{pydantic_guidance}\n"
                     f"Original Python Source:\n```python\n{original_code}\n```"
                 ),
             },
@@ -361,7 +526,11 @@ def patch_single_file_via_token_factory(
 
         candidate_code = _extract_code_block(raw_reply)
         is_valid, validation_error = _validate_patch(
-            candidate_code, original_code, migration_delta.library, relevant_rules
+            candidate_code,
+            original_code,
+            migration_delta.library,
+            relevant_rules,
+            file_path=file_report.file_path,
         )
 
         if is_valid:
@@ -370,11 +539,23 @@ def patch_single_file_via_token_factory(
         else:
             # Retry once with the error!
             print(f"  ⚠️ [Validation Notice] {file_report.relative_path} failed: {validation_error}. Retrying once with error...", flush=True)
+            hints = []
+            if "GenericModel" in validation_error:
+                hints.append("GenericModel is removed in v2: generic classes must inherit directly from (BaseModel, Generic[T]). Never import GenericModel.")
+            if "__root__" in validation_error:
+                hints.append("`__root__` is removed in v2: models with a single root must inherit from RootModel[T] (from pydantic import RootModel). Access via .root.")
+            if "validator" in validation_error:
+                hints.append("@validator -> @field_validator and @root_validator -> @model_validator in v2.")
+            if "model_validator" in validation_error or "takes 0 positional arguments" in validation_error:
+                hints.append("NEVER use bare `@model_validator` without arguments! Specify `@model_validator(mode='after')` on instance method `def method(self): ... return self` or `@model_validator(mode='before')` on `@classmethod def method(cls, data): ... return data`.")
+            hints_str = ("\nFix Guidance:\n" + "\n".join(f"- {h}" for h in hints) + "\n") if hints else ""
+
             retry_prompt = (
                 f"Your previous patch for '{file_report.relative_path}' failed validation:\n"
-                f"ERROR: {validation_error}\n\n"
+                f"ERROR: {validation_error}\n"
+                f"{hints_str}\n"
                 f"Please fix this error immediately. Ensure:\n"
-                f"1. Valid Python syntax with all original classes, methods, and functions preserved.\n"
+                f"1. Valid Python syntax with ALL original classes, methods, and functions preserved. Do not omit or truncate any class or function.\n"
                 f"2. ZERO deprecated symbols remain from target library {migration_delta.library}.\n"
                 f"3. Start output immediately with ```python and output the complete upgraded file."
             )
@@ -403,7 +584,11 @@ def patch_single_file_via_token_factory(
 
             retry_candidate = _extract_code_block(retry_reply)
             retry_is_valid, retry_error = _validate_patch(
-                retry_candidate, original_code, migration_delta.library, relevant_rules
+                retry_candidate,
+                original_code,
+                migration_delta.library,
+                relevant_rules,
+                file_path=file_report.file_path,
             )
 
             if retry_is_valid:

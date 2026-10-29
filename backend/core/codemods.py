@@ -3,6 +3,7 @@ import ast
 import difflib
 import os
 import py_compile
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -45,6 +46,247 @@ SAFE_V2_SYMBOLS = {
     "pydantic_settings.basesettings",
     "pydantic_settings.settingsconfigdict",
 }
+
+SAFE_BUILTIN_TYPES = {
+    "str", "int", "float", "bool", "dict", "list", "set", "tuple", "any", "none", "decimal", "datetime", "bytes"
+}
+
+
+def _is_safe_uncovered_symbol(
+    unc_sym: str,
+    known_classes: Set[str],
+    res_visitor: Optional[FileASTVisitor] = None,
+) -> bool:
+    c_unc = unc_sym.strip()
+    if not c_unc:
+        return True
+    unc_lower = c_unc.lower()
+
+    # Rule 1: Safe library constructs (strip inheritance and calls)
+    base_sym = unc_lower.replace(" (inheritance)", "").replace("(inheritance)", "").rstrip("()")
+    if unc_lower in SAFE_V2_SYMBOLS or base_sym in SAFE_V2_SYMBOLS:
+        return True
+
+    # Rule 2: User-defined model classes from known_library_classes
+    known_lower = {k.lower() for k in known_classes}
+    if unc_lower in known_lower or base_sym in known_lower:
+        return True
+
+    # Rule 3: Typed parameters / annotations
+    if ":" in unc_lower:
+        type_part = unc_lower.split(":", 1)[1].strip()
+        clean_type = type_part.replace("[", " ").replace("]", " ").split()[-1] if type_part else ""
+        if clean_type in known_lower or clean_type in SAFE_V2_SYMBOLS or clean_type in SAFE_BUILTIN_TYPES:
+            return True
+
+    if res_visitor:
+        if any(u.usage_type == "typed_parameter" and (u.symbol_name.lower() == unc_lower or unc_lower in u.symbol_name.lower()) for u in res_visitor.usages):
+            return True
+
+    # Rule 4: User-defined methods on model classes
+    if c_unc.startswith(".") and c_unc.endswith("()"):
+        method_name = c_unc[1:-2].strip()
+        if method_name and res_visitor and any(f"def {method_name}(" in line for line in res_visitor.source_lines):
+            return True
+
+    # Rule 5: Variable assignment / instantiation of known library class (e.g. settings = AppSettings())
+    if "=" in unc_lower:
+        rhs = unc_lower.split("=")[-1].strip().rstrip("()")
+        rhs_sym = rhs.split()[-1] if rhs else ""
+        if rhs in known_lower or rhs_sym in known_lower or rhs in SAFE_V2_SYMBOLS or rhs_sym in SAFE_V2_SYMBOLS:
+            return True
+
+    return False
+
+
+class ValuesToValidationInfoTransformer(cst.CSTTransformer):
+    """
+    Rewrites references to the legacy validator `values` parameter to `info.data`.
+    E.g. values.get(x) -> info.data.get(x), values[x] -> info.data[x].
+    """
+    def leave_Attribute(self, original_node: cst.Attribute, updated_node: cst.Attribute) -> cst.Attribute:
+        if isinstance(updated_node.value, cst.Name) and updated_node.value.value == "values":
+            return updated_node.with_changes(value=cst.parse_expression("info.data"))
+        return updated_node
+
+    def leave_Subscript(self, original_node: cst.Subscript, updated_node: cst.Subscript) -> cst.Subscript:
+        if isinstance(updated_node.value, cst.Name) and updated_node.value.value == "values":
+            return updated_node.with_changes(value=cst.parse_expression("info.data"))
+        return updated_node
+
+    def leave_Assign(self, original_node: cst.Assign, updated_node: cst.Assign) -> cst.Assign:
+        new_targets = []
+        for t in updated_node.targets:
+            target = t.target
+            if isinstance(target, cst.Subscript) and isinstance(target.value, cst.Name) and target.value.value == "values":
+                new_targets.append(t.with_changes(target=target.with_changes(value=cst.parse_expression("info.data"))))
+            else:
+                new_targets.append(t)
+        return updated_node.with_changes(targets=new_targets)
+
+    def leave_Comparison(self, original_node: cst.Comparison, updated_node: cst.Comparison) -> cst.Comparison:
+        new_left = updated_node.left
+        if isinstance(new_left, cst.Name) and new_left.value == "values":
+            new_left = cst.parse_expression("info.data")
+        new_comps = []
+        for comp in updated_node.comparisons:
+            if isinstance(comp.comparator, cst.Name) and comp.comparator.value == "values":
+                new_comps.append(comp.with_changes(comparator=cst.parse_expression("info.data")))
+            else:
+                new_comps.append(comp)
+        return updated_node.with_changes(left=new_left, comparisons=new_comps)
+
+    def leave_Arg(self, original_node: cst.Arg, updated_node: cst.Arg) -> cst.Arg:
+        if isinstance(updated_node.value, cst.Name) and updated_node.value.value == "values":
+            return updated_node.with_changes(value=cst.parse_expression("info.data"))
+        return updated_node
+
+    def leave_Return(self, original_node: cst.Return, updated_node: cst.Return) -> cst.Return:
+        if isinstance(updated_node.value, cst.Name) and updated_node.value.value == "values":
+            return updated_node.with_changes(value=cst.parse_expression("info.data"))
+        return updated_node
+
+    def leave_If(self, original_node: cst.If, updated_node: cst.If) -> cst.If:
+        if isinstance(updated_node.test, cst.Name) and updated_node.test.value == "values":
+            return updated_node.with_changes(test=cst.parse_expression("info.data"))
+        return updated_node
+
+    def leave_For(self, original_node: cst.For, updated_node: cst.For) -> cst.For:
+        if isinstance(updated_node.iter, cst.Name) and updated_node.iter.value == "values":
+            return updated_node.with_changes(iter=cst.parse_expression("info.data"))
+        return updated_node
+
+
+class RootValidatorBeforeTransformer(cst.CSTTransformer):
+    """
+    Rewrites references from `values` to `data` in mode='before' model validators.
+    """
+    def leave_Return(self, original_node: cst.Return, updated_node: cst.Return) -> cst.Return:
+        if isinstance(updated_node.value, cst.Name) and updated_node.value.value == "values":
+            return updated_node.with_changes(value=cst.Name("data"))
+        return updated_node
+
+    def leave_Attribute(self, original_node: cst.Attribute, updated_node: cst.Attribute) -> cst.Attribute:
+        if isinstance(updated_node.value, cst.Name) and updated_node.value.value == "values":
+            return updated_node.with_changes(value=cst.Name("data"))
+        return updated_node
+
+    def leave_Subscript(self, original_node: cst.Subscript, updated_node: cst.Subscript) -> cst.Subscript:
+        if isinstance(updated_node.value, cst.Name) and updated_node.value.value == "values":
+            return updated_node.with_changes(value=cst.Name("data"))
+        return updated_node
+
+    def leave_Assign(self, original_node: cst.Assign, updated_node: cst.Assign) -> cst.Assign:
+        new_targets = []
+        for t in updated_node.targets:
+            target = t.target
+            if isinstance(target, cst.Subscript):
+                if isinstance(target.value, cst.Name) and target.value.value == "values":
+                    new_targets.append(t.with_changes(target=target.with_changes(value=cst.Name("data"))))
+                    continue
+            new_targets.append(t)
+        return updated_node.with_changes(targets=new_targets)
+
+    def leave_Comparison(self, original_node: cst.Comparison, updated_node: cst.Comparison) -> cst.Comparison:
+        new_left = updated_node.left
+        if isinstance(new_left, cst.Name) and new_left.value == "values":
+            new_left = cst.Name("data")
+        new_comps = []
+        for comp in updated_node.comparisons:
+            if isinstance(comp.comparator, cst.Name) and comp.comparator.value == "values":
+                new_comps.append(comp.with_changes(comparator=cst.Name("data")))
+            else:
+                new_comps.append(comp)
+        return updated_node.with_changes(left=new_left, comparisons=new_comps)
+
+    def leave_Arg(self, original_node: cst.Arg, updated_node: cst.Arg) -> cst.Arg:
+        if isinstance(updated_node.value, cst.Name) and updated_node.value.value == "values":
+            return updated_node.with_changes(value=cst.Name("data"))
+        return updated_node
+
+    def leave_If(self, original_node: cst.If, updated_node: cst.If) -> cst.If:
+        if isinstance(updated_node.test, cst.Name) and updated_node.test.value == "values":
+            return updated_node.with_changes(test=cst.Name("data"))
+        return updated_node
+
+    def leave_For(self, original_node: cst.For, updated_node: cst.For) -> cst.For:
+        if isinstance(updated_node.iter, cst.Name) and updated_node.iter.value == "values":
+            return updated_node.with_changes(iter=cst.Name("data"))
+        return updated_node
+
+
+class RootValidatorAfterTransformer(cst.CSTTransformer):
+    """
+    Rewrites references in mode='after' model validators to instance attributes on self.
+    """
+    def leave_Return(self, original_node: cst.Return, updated_node: cst.Return) -> cst.Return:
+        if isinstance(updated_node.value, cst.Name) and updated_node.value.value == "values":
+            return updated_node.with_changes(value=cst.Name("self"))
+        return updated_node
+
+    def leave_Call(self, original_node: cst.Call, updated_node: cst.Call) -> Union[cst.Call, cst.BaseExpression]:
+        if isinstance(updated_node.func, cst.Attribute):
+            if isinstance(updated_node.func.value, cst.Name) and updated_node.func.value.value == "values":
+                if updated_node.func.attr.value == "get":
+                    args = list(updated_node.args)
+                    if len(args) == 1:
+                        args.append(cst.Arg(value=cst.Name("None")))
+                    call_args = [cst.Arg(value=cst.Name("self"))] + args
+                    return cst.Call(func=cst.Name("getattr"), args=call_args)
+        return updated_node
+
+    def leave_Assign(self, original_node: cst.Assign, updated_node: cst.Assign) -> cst.Assign:
+        new_targets = []
+        for t in updated_node.targets:
+            target = t.target
+            if isinstance(target, cst.Subscript):
+                if isinstance(target.value, cst.Name) and target.value.value == "values":
+                    if len(target.slice) == 1 and isinstance(target.slice[0].slice, cst.Index):
+                        idx_val = target.slice[0].slice.value
+                        if isinstance(idx_val, cst.SimpleString):
+                            field_name = idx_val.evaluated_value
+                            if field_name.isidentifier():
+                                new_target = cst.Attribute(value=cst.Name("self"), attr=cst.Name(field_name))
+                                new_targets.append(t.with_changes(target=new_target))
+                                continue
+            new_targets.append(t)
+        return updated_node.with_changes(targets=new_targets)
+
+    def leave_Subscript(self, original_node: cst.Subscript, updated_node: cst.Subscript) -> cst.BaseExpression:
+        if isinstance(updated_node.value, cst.Name) and updated_node.value.value == "values":
+            if len(updated_node.slice) == 1 and isinstance(updated_node.slice[0].slice, cst.Index):
+                idx_val = updated_node.slice[0].slice.value
+                if isinstance(idx_val, cst.SimpleString):
+                    field_name = idx_val.evaluated_value
+                    if field_name.isidentifier():
+                        return cst.Attribute(value=cst.Name("self"), attr=cst.Name(field_name))
+                else:
+                    return cst.Call(
+                        func=cst.Name("getattr"),
+                        args=[cst.Arg(value=cst.Name("self")), cst.Arg(value=idx_val)],
+                    )
+        return updated_node
+
+    def leave_Comparison(self, original_node: cst.Comparison, updated_node: cst.Comparison) -> Union[cst.Comparison, cst.Call]:
+        left = updated_node.left
+        for comp in updated_node.comparisons:
+            if isinstance(comp.operator, cst.In):
+                if isinstance(comp.comparator, cst.Name) and comp.comparator.value == "values":
+                    return cst.Call(
+                        func=cst.Name("hasattr"),
+                        args=[cst.Arg(value=cst.Name("self")), cst.Arg(value=left)],
+                    )
+        return updated_node
+
+    def leave_Arg(self, original_node: cst.Arg, updated_node: cst.Arg) -> cst.Arg:
+        if isinstance(updated_node.value, cst.Name) and updated_node.value.value == "values":
+            return updated_node.with_changes(value=cst.Name("self"))
+        return updated_node
+
+    def leave_If(self, original_node: cst.If, updated_node: cst.If) -> cst.If:
+        if isinstance(updated_node.test, cst.Name) and updated_node.test.value == "values":
+            return updated_node.with_changes(test=cst.Name("self"))
+        return updated_node
 
 
 def _compute_unified_diff(original: str, patched: str, rel_path: str) -> str:
@@ -112,7 +354,6 @@ class PydanticV2MechanicalCodemod(cst.CSTTransformer):
             "copy": "model_copy",
             "parse_obj": "model_validate",
             "parse_raw": "model_validate_json",
-            "schema_json": "model_json_schema",
             "schema": "model_json_schema",
             "construct": "model_construct",
             "from_orm": "model_validate",
@@ -121,6 +362,7 @@ class PydanticV2MechanicalCodemod(cst.CSTTransformer):
             "regex": "pattern",
             "min_items": "min_length",
             "max_items": "max_length",
+            "env": "validation_alias",
         }
         self.has_config_dict = False
         self.has_settings_config_dict = False
@@ -131,6 +373,10 @@ class PydanticV2MechanicalCodemod(cst.CSTTransformer):
         self.has_base_settings = False
         self.has_base_model = False
         self.has_generic_from_typing = False
+        self.has_field = False
+        self.has_validation_info = False
+        self.has_json_import = False
+        self.has_self_import = False
 
         self.has_validator_removed = False
         self.has_root_validator_removed = False
@@ -138,14 +384,48 @@ class PydanticV2MechanicalCodemod(cst.CSTTransformer):
         self.has_generic_model_removed = False
         self.has_base_settings_removed = False
 
+        self.can_resolve = True
+        self.class_always_fields_stack: List[Optional[Set[str]]] = []
+
         self.modified = False
+
+    def visit_ClassDef(self, node: cst.ClassDef) -> Optional[bool]:
+        if node.name.value == "Config":
+            self.class_always_fields_stack.append(None)
+        else:
+            self.class_always_fields_stack.append(set())
+        return True
 
     def leave_Call(self, original_node: cst.Call, updated_node: cst.Call) -> Union[cst.Call, cst.BaseExpression]:
         # 1. Method call renames (.dict, .json, .copy, .parse_obj, .parse_raw, .schema_json, .schema, .construct)
         # Apply rename ONLY if line number matches a known model call from FileASTVisitor!
         if isinstance(updated_node.func, cst.Attribute):
             attr_name = updated_node.func.attr.value
-            if attr_name in self.method_renames:
+            if attr_name == "schema_json":
+                should_rename = True
+                if self.target_lines is not None:
+                    try:
+                        pos = self.get_metadata(PositionProvider, original_node)
+                        call_lines = set(range(pos.start.line, pos.end.line + 1))
+                        if not call_lines.intersection(self.target_lines):
+                            should_rename = False
+                    except Exception:
+                        should_rename = False
+
+                if should_rename:
+                    self.modified = True
+                    self.has_json_import = True
+                    receiver = updated_node.func.value
+                    model_json_schema_call = cst.Call(
+                        func=cst.Attribute(value=receiver, attr=cst.Name("model_json_schema")),
+                        args=[],
+                    )
+                    dumps_args = [cst.Arg(value=model_json_schema_call)] + list(updated_node.args)
+                    return cst.Call(
+                        func=cst.Attribute(value=cst.Name("json"), attr=cst.Name("dumps")),
+                        args=dumps_args,
+                    )
+            elif attr_name in self.method_renames:
                 should_rename = True
                 if self.target_lines is not None:
                     try:
@@ -208,88 +488,194 @@ class PydanticV2MechanicalCodemod(cst.CSTTransformer):
         return updated_node
 
     def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.FunctionDef:
-        new_decorators = []
-        func_modified = False
+        is_root_val = False
+        root_val_call = None
+        root_val_mode = "after"
+
+        is_validator = False
+        validator_call = None
 
         for dec in updated_node.decorators:
             d = dec.decorator
-            # 1. root_validator -> model_validator
-            is_root_val = False
-            root_val_call = None
-            if isinstance(d, cst.Name) and d.value == "root_validator":
+            func_name = ""
+            call_node = None
+            if isinstance(d, cst.Name):
+                func_name = d.value
+            elif isinstance(d, cst.Call):
+                call_node = d
+                if isinstance(d.func, cst.Name):
+                    func_name = d.func.value
+                elif isinstance(d.func, cst.Attribute):
+                    func_name = d.func.attr.value
+
+            if func_name == "root_validator":
                 is_root_val = True
-            elif isinstance(d, cst.Call):
-                func_name = d.func.value if isinstance(d.func, cst.Name) else (d.func.attr.value if isinstance(d.func, cst.Attribute) else "")
-                if func_name == "root_validator":
-                    is_root_val = True
-                    root_val_call = d
-
-            if is_root_val:
-                func_modified = True
-                self.modified = True
-                self.has_model_validator = True
-                self.has_root_validator_removed = True
-
-                mode = "after"
-                if root_val_call:
-                    for a in root_val_call.args:
-                        if a.keyword and a.keyword.value == "pre":
-                            if isinstance(a.value, cst.Name) and a.value.value == "True":
-                                mode = "before"
-                            elif isinstance(a.value, cst.Name) and a.value.value == "False":
-                                mode = "after"
-                new_d = cst.parse_expression(f'model_validator(mode="{mode}")')
-                new_decorators.append(dec.with_changes(decorator=new_d))
-                continue
-
-            # 2. validator -> field_validator
-            is_validator = False
-            validator_call = None
-            if isinstance(d, cst.Name) and d.value == "validator":
+                root_val_call = call_node
+                if call_node:
+                    for a in call_node.args:
+                        if a.keyword and a.keyword.value == "pre" and isinstance(a.value, cst.Name) and a.value.value == "True":
+                            root_val_mode = "before"
+            elif func_name == "validator":
                 is_validator = True
-            elif isinstance(d, cst.Call):
-                func_name = d.func.value if isinstance(d.func, cst.Name) else (d.func.attr.value if isinstance(d.func, cst.Attribute) else "")
-                if func_name == "validator":
-                    is_validator = True
-                    validator_call = d
+                validator_call = call_node
 
-            if is_validator:
-                func_modified = True
-                self.modified = True
-                self.has_field_validator = True
-                self.has_validator_removed = True
+        if is_root_val:
+            self.modified = True
+            self.has_model_validator = True
+            self.has_root_validator_removed = True
 
-                new_args = []
-                if validator_call:
-                    for a in validator_call.args:
-                        if a.keyword and a.keyword.value == "pre":
-                            val = '"before"' if (isinstance(a.value, cst.Name) and a.value.value == "True") else '"after"'
-                            new_args.append(a.with_changes(keyword=cst.Name("mode"), value=cst.SimpleString(val)))
-                        elif a.keyword and a.keyword.value == "always":
-                            new_args.append(a.with_changes(keyword=cst.Name("validate_default"), value=a.value))
-                        elif a.keyword and a.keyword.value == "each_item":
-                            continue
-                        else:
-                            new_args.append(a)
-                    new_d = validator_call.with_changes(func=cst.Name("field_validator"), args=new_args)
+            new_decorators = []
+            for dec in updated_node.decorators:
+                d = dec.decorator
+                func_name = ""
+                if isinstance(d, cst.Name):
+                    func_name = d.value
+                elif isinstance(d, cst.Call):
+                    func_name = d.func.value if isinstance(d.func, cst.Name) else (d.func.attr.value if isinstance(d.func, cst.Attribute) else "")
+
+                if func_name == "root_validator":
+                    new_dec = dec.with_changes(decorator=cst.parse_expression(f'model_validator(mode="{root_val_mode}")'))
+                    new_decorators.append(new_dec)
+                elif func_name == "classmethod" and root_val_mode == "after":
+                    # Convert to instance method: drop @classmethod
+                    continue
                 else:
-                    new_d = cst.Name("field_validator")
+                    new_decorators.append(dec)
 
-                new_decorators.append(dec.with_changes(decorator=new_d))
-
-                # Ensure @classmethod is present on field_validator
+            if root_val_mode == "before":
                 has_classmethod = any(
                     isinstance(x.decorator, cst.Name) and x.decorator.value == "classmethod"
-                    for x in updated_node.decorators
+                    for x in new_decorators
                 )
                 if not has_classmethod:
                     new_decorators.append(cst.Decorator(decorator=cst.Name("classmethod")))
-                continue
 
-            new_decorators.append(dec)
+                new_params = []
+                for p in updated_node.params.params:
+                    if p.name.value == "cls":
+                        new_params.append(p)
+                    elif p.name.value in ("values", "data"):
+                        new_params.append(p.with_changes(name=cst.Name("data")))
+                    else:
+                        new_params.append(p)
 
-        if func_modified:
-            return updated_node.with_changes(decorators=new_decorators)
+                updated_node = updated_node.with_changes(
+                    decorators=new_decorators,
+                    params=updated_node.params.with_changes(params=new_params),
+                )
+                return updated_node.visit(RootValidatorBeforeTransformer())
+            else:
+                self.has_self_import = True
+                ret_anno = updated_node.returns
+                if ret_anno is not None:
+                    ret_anno = cst.Annotation(annotation=cst.Name("Self"))
+                updated_node = updated_node.with_changes(
+                    decorators=new_decorators,
+                    params=cst.Parameters(params=[cst.Param(name=cst.Name("self"))]),
+                    returns=ret_anno,
+                )
+                return updated_node.visit(RootValidatorAfterTransformer())
+
+        if is_validator:
+            self.modified = True
+            self.has_field_validator = True
+            self.has_validator_removed = True
+
+            has_each_item = False
+            has_always = False
+            target_field_names = []
+
+            if validator_call:
+                for a in validator_call.args:
+                    if a.keyword and a.keyword.value == "each_item":
+                        has_each_item = True
+                    elif a.keyword and a.keyword.value == "always":
+                        if isinstance(a.value, cst.Name) and a.value.value == "True":
+                            has_always = True
+                    elif a.keyword is None:
+                        if isinstance(a.value, cst.SimpleString):
+                            target_field_names.append(a.value.evaluated_value)
+
+            # Never pass validate_default or each_item to field_validator: if each_item is present, leave the file residual.
+            if has_each_item:
+                self.can_resolve = False
+
+            if has_always:
+                if self.class_always_fields_stack and self.class_always_fields_stack[-1] is not None:
+                    self.class_always_fields_stack[-1].update(target_field_names)
+                else:
+                    self.can_resolve = False
+
+            new_args = []
+            if validator_call:
+                for a in validator_call.args:
+                    if a.keyword and a.keyword.value == "pre":
+                        val = '"before"' if (isinstance(a.value, cst.Name) and a.value.value == "True") else '"after"'
+                        new_args.append(a.with_changes(keyword=cst.Name("mode"), value=cst.SimpleString(val)))
+                    elif a.keyword and a.keyword.value in ("always", "validate_default", "each_item", "check_fields"):
+                        continue
+                    else:
+                        new_args.append(a)
+                if new_args:
+                    new_args[-1] = new_args[-1].with_changes(comma=cst.MaybeSentinel.DEFAULT)
+                new_d = validator_call.with_changes(func=cst.Name("field_validator"), args=new_args)
+            else:
+                new_d = cst.Name("field_validator")
+
+            new_decorators = []
+            for dec in updated_node.decorators:
+                d = dec.decorator
+                func_name = ""
+                if isinstance(d, cst.Name):
+                    func_name = d.value
+                elif isinstance(d, cst.Call):
+                    func_name = d.func.value if isinstance(d.func, cst.Name) else (d.func.attr.value if isinstance(d.func, cst.Attribute) else "")
+                if func_name == "validator":
+                    new_decorators.append(dec.with_changes(decorator=new_d))
+                else:
+                    new_decorators.append(dec)
+
+            has_classmethod = any(
+                isinstance(x.decorator, cst.Name) and x.decorator.value == "classmethod"
+                for x in new_decorators
+            )
+            if not has_classmethod:
+                new_decorators.append(cst.Decorator(decorator=cst.Name("classmethod")))
+
+            # Rewrite values/ValidationInfo signatures (values -> info: ValidationInfo and values.get(x) -> info.data.get(x))
+            new_params = []
+            has_values_param = False
+            for p in updated_node.params.params:
+                if p.name.value == "values":
+                    has_values_param = True
+                    self.has_validation_info = True
+                    new_params.append(
+                        p.with_changes(
+                            name=cst.Name("info"),
+                            annotation=cst.Annotation(annotation=cst.Name("ValidationInfo")),
+                            default=None,
+                        )
+                    )
+                elif p.name.value == "info":
+                    has_values_param = True
+                    self.has_validation_info = True
+                    new_params.append(
+                        p.with_changes(
+                            annotation=cst.Annotation(annotation=cst.Name("ValidationInfo")),
+                        )
+                    )
+                else:
+                    new_params.append(p)
+
+            updated_node = updated_node.with_changes(
+                decorators=new_decorators,
+                params=updated_node.params.with_changes(params=new_params),
+            )
+            if has_values_param:
+                updated_node = updated_node.visit(ValuesToValidationInfoTransformer())
+
+            return updated_node
+
         return updated_node
 
     def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.ClassDef:
@@ -375,6 +761,12 @@ class PydanticV2MechanicalCodemod(cst.CSTTransformer):
                                         else:
                                             dict_args.append(f"{name}={val_str}")
 
+                if is_settings_class:
+                    if not any("populate_by_name" in a for a in dict_args):
+                        dict_args.append("populate_by_name=True")
+                    if not any("extra" in a for a in dict_args):
+                        dict_args.append('extra="ignore"')
+
                 args_joined = ", ".join(dict_args)
                 cfg_cls = "SettingsConfigDict" if is_settings_class else "ConfigDict"
                 config_str = f"model_config = {cfg_cls}({args_joined})"
@@ -394,6 +786,60 @@ class PydanticV2MechanicalCodemod(cst.CSTTransformer):
                         new_body.append(s)
             else:
                 new_body.append(stmt)
+
+        has_config_class = any(isinstance(stmt, cst.ClassDef) and stmt.name.value == "Config" for stmt in updated_node.body.body)
+        if is_settings_class and not has_config_class:
+            self.has_settings_config_dict = True
+            self.has_base_settings = True
+            class_modified = True
+            self.modified = True
+            new_body.append(cst.parse_statement('model_config = SettingsConfigDict(populate_by_name=True, extra="ignore")'))
+
+        # 3. Apply validate_default=True to matching fields if always=True validators were present
+        always_fields = self.class_always_fields_stack.pop() if self.class_always_fields_stack else None
+        if always_fields:
+            found_fields = set()
+            new_body_with_fields = []
+            for stmt in new_body:
+                if isinstance(stmt, cst.SimpleStatementLine) and len(stmt.body) == 1 and isinstance(stmt.body[0], cst.AnnAssign):
+                    ann = stmt.body[0]
+                    if isinstance(ann.target, cst.Name) and ann.target.value in always_fields:
+                        field_name = ann.target.value
+                        found_fields.add(field_name)
+                        self.has_field = True
+                        val = ann.value
+                        if val is None:
+                            new_val = cst.parse_expression("Field(..., validate_default=True)")
+                        elif (
+                            isinstance(val, cst.Call)
+                            and (
+                                (isinstance(val.func, cst.Name) and val.func.value == "Field")
+                                or (isinstance(val.func, cst.Attribute) and val.func.attr.value == "Field")
+                            )
+                        ):
+                            has_val_def = any(a.keyword and a.keyword.value == "validate_default" for a in val.args)
+                            if not has_val_def:
+                                new_args = list(val.args) + [cst.Arg(keyword=cst.Name("validate_default"), value=cst.Name("True"))]
+                                new_val = val.with_changes(args=new_args)
+                            else:
+                                new_val = val
+                        else:
+                            new_val = cst.Call(
+                                func=cst.Name("Field"),
+                                args=[
+                                    cst.Arg(keyword=cst.Name("default"), value=val),
+                                    cst.Arg(keyword=cst.Name("validate_default"), value=cst.Name("True")),
+                                ],
+                            )
+                        new_body_with_fields.append(stmt.with_changes(body=[ann.with_changes(value=new_val)]))
+                        class_modified = True
+                        self.modified = True
+                        continue
+                new_body_with_fields.append(stmt)
+            new_body = new_body_with_fields
+
+            if always_fields - found_fields:
+                self.can_resolve = False
 
         if class_modified:
             return updated_node.with_changes(
@@ -437,11 +883,12 @@ class PydanticV2MechanicalCodemod(cst.CSTTransformer):
 class PydanticImportUpdater(cst.CSTTransformer):
     """
     Synchronizes imports after deterministic transforms:
-    - Adds ConfigDict, field_serializer, field_validator, model_validator, TypeAdapter, BaseModel to pydantic
+    - Adds ConfigDict, field_serializer, field_validator, model_validator, TypeAdapter, BaseModel, Field, ValidationInfo to pydantic
     - Removes validator, root_validator, parse_obj_as, BaseSettings, GenericModel from pydantic
     - Removes from pydantic.generics import GenericModel
     - Adds from pydantic_settings import BaseSettings, SettingsConfigDict
-    - Adds Generic to typing if needed
+    - Adds Generic, Self to typing if needed
+    - Adds import json if needed
     """
 
     def __init__(
@@ -455,6 +902,10 @@ class PydanticImportUpdater(cst.CSTTransformer):
         need_base_settings: bool = False,
         need_settings_config_dict: bool = False,
         need_generic_typing: bool = False,
+        need_field: bool = False,
+        need_validation_info: bool = False,
+        need_json: bool = False,
+        need_self: bool = False,
     ):
         super().__init__()
         self.add_pydantic: Set[str] = set()
@@ -470,6 +921,10 @@ class PydanticImportUpdater(cst.CSTTransformer):
             self.add_pydantic.add("TypeAdapter")
         if need_base_model:
             self.add_pydantic.add("BaseModel")
+        if need_field:
+            self.add_pydantic.add("Field")
+        if need_validation_info:
+            self.add_pydantic.add("ValidationInfo")
 
         self.remove_pydantic = {"validator", "root_validator", "parse_obj_as", "BaseSettings", "GenericModel"}
 
@@ -480,21 +935,30 @@ class PydanticImportUpdater(cst.CSTTransformer):
             self.add_settings.add("SettingsConfigDict")
 
         self.need_generic_typing = need_generic_typing
+        self.need_self = need_self
+        self.need_json = need_json
 
         self.pydantic_import_found = False
         self.settings_import_found = False
         self.typing_import_found = False
+        self.json_import_found = False
 
     def leave_SimpleStatementLine(
         self, original_node: cst.SimpleStatementLine, updated_node: cst.SimpleStatementLine
     ) -> Union[cst.SimpleStatementLine, cst.RemovalSentinel]:
         new_body = []
         for item in updated_node.body:
-            if isinstance(item, cst.ImportFrom):
+            if isinstance(item, cst.Import):
+                for alias in item.names:
+                    if alias.name.value == "json":
+                        self.json_import_found = True
+            elif isinstance(item, cst.ImportFrom):
                 mod = cst.Module([]).code_for_node(item.module).strip() if item.module else ""
-                if mod == "pydantic.generics":
+                if mod == "json":
+                    self.json_import_found = True
+                elif mod == "pydantic.generics":
                     continue
-                if mod == "pydantic":
+                elif mod == "pydantic":
                     self.pydantic_import_found = True
                     kept_aliases = [
                         a for a in item.names
@@ -509,7 +973,7 @@ class PydanticImportUpdater(cst.CSTTransformer):
                         continue
                     new_body.append(item.with_changes(names=kept_aliases))
                     continue
-                if mod == "pydantic_settings":
+                elif mod == "pydantic_settings":
                     self.settings_import_found = True
                     kept_aliases = list(item.names)
                     kept_names = {a.name.value for a in kept_aliases}
@@ -519,12 +983,16 @@ class PydanticImportUpdater(cst.CSTTransformer):
                             kept_names.add(name)
                     new_body.append(item.with_changes(names=kept_aliases))
                     continue
-                if mod == "typing" and self.need_generic_typing:
+                elif mod == "typing":
                     self.typing_import_found = True
                     kept_aliases = list(item.names)
                     kept_names = {a.name.value for a in kept_aliases}
-                    if "Generic" not in kept_names:
+                    if self.need_generic_typing and "Generic" not in kept_names:
                         kept_aliases.append(cst.ImportAlias(name=cst.Name("Generic")))
+                        kept_names.add("Generic")
+                    if self.need_self and "Self" not in kept_names:
+                        kept_aliases.append(cst.ImportAlias(name=cst.Name("Self")))
+                        kept_names.add("Self")
                     new_body.append(item.with_changes(names=kept_aliases))
                     continue
             new_body.append(item)
@@ -535,8 +1003,18 @@ class PydanticImportUpdater(cst.CSTTransformer):
 
     def leave_Module(self, original_node: cst.Module, updated_node: cst.Module) -> cst.Module:
         new_stmts = []
+        if self.need_json and not self.json_import_found:
+            new_stmts.append(cst.parse_statement("import json"))
+
+        typing_add = []
         if self.need_generic_typing and not self.typing_import_found:
-            new_stmts.append(cst.parse_statement("from typing import Generic"))
+            typing_add.append("Generic")
+        if self.need_self and not self.typing_import_found:
+            typing_add.append("Self")
+        if typing_add:
+            names = ", ".join(sorted(typing_add))
+            new_stmts.append(cst.parse_statement(f"from typing import {names}"))
+
         if self.add_settings and not self.settings_import_found:
             names = ", ".join(sorted(self.add_settings))
             new_stmts.append(cst.parse_statement(f"from pydantic_settings import {names}"))
@@ -554,7 +1032,8 @@ def apply_deterministic_codemods(
     target_library: str = "pydantic",
     model_call_lines: Optional[Set[int]] = None,
     library_classes: Optional[Set[str]] = None,
-) -> Tuple[str, bool]:
+    return_can_resolve: bool = False,
+) -> Union[Tuple[str, bool], Tuple[str, bool, bool]]:
     """
     Applies deterministic libcst codemods to source code.
     Returns (code, False) unless target_library == "pydantic".
@@ -564,10 +1043,10 @@ def apply_deterministic_codemods(
     """
     clean_lib = (target_library or "").lower().replace("-", "_").strip()
     if clean_lib != "pydantic":
-        return code, False
+        return (code, False, False) if return_can_resolve else (code, False)
 
     if not code.strip():
-        return code, False
+        return (code, False, True) if return_can_resolve else (code, False)
 
     # Extract model method call lines using FileASTVisitor if not explicitly provided
     if model_call_lines is None:
@@ -583,7 +1062,7 @@ def apply_deterministic_codemods(
     try:
         cst_tree = cst.parse_module(code)
     except Exception:
-        return code, False
+        return (code, False, False) if return_can_resolve else (code, False)
 
     wrapper = cst.MetadataWrapper(cst_tree)
     transformer = PydanticV2MechanicalCodemod(target_lines=model_call_lines)
@@ -604,10 +1083,14 @@ def apply_deterministic_codemods(
         or transformer.has_generic_model_removed
         or transformer.has_base_settings_removed
         or transformer.has_generic_from_typing
+        or transformer.has_field
+        or transformer.has_validation_info
+        or transformer.has_json_import
+        or transformer.has_self_import
     )
 
     if not transformer.modified and not needs_import_update:
-        return code, False
+        return (code, False, transformer.can_resolve) if return_can_resolve else (code, False)
 
     import_updater = PydanticImportUpdater(
         need_config_dict=transformer.has_config_dict,
@@ -619,11 +1102,17 @@ def apply_deterministic_codemods(
         need_base_settings=transformer.has_base_settings,
         need_settings_config_dict=transformer.has_settings_config_dict,
         need_generic_typing=transformer.has_generic_from_typing,
+        need_field=transformer.has_field,
+        need_validation_info=transformer.has_validation_info,
+        need_json=transformer.has_json_import,
+        need_self=transformer.has_self_import,
     )
     final_tree = transformed_tree.visit(import_updater)
     final_code = final_tree.code
 
     was_modified = final_code != code
+    if return_can_resolve:
+        return final_code, was_modified, transformer.can_resolve
     return final_code, was_modified
 
 
@@ -658,6 +1147,10 @@ def partition_files_for_stage3(
                 parts = usage.symbol_name.split()
                 if parts:
                     known_library_classes.add(parts[0])
+                if usage.deprecation_hint:
+                    m = re.search(r"Class `(\w+)` inherits", usage.deprecation_hint)
+                    if m:
+                        known_library_classes.add(m.group(1))
 
     # Map of all deprecated symbols from migration rules
     deprecated_patterns: Set[str] = set()
@@ -686,14 +1179,15 @@ def partition_files_for_stage3(
         except Exception:
             pass
 
-        codemodded_code, modified = apply_deterministic_codemods(
+        codemodded_code, modified, can_resolve = apply_deterministic_codemods(
             original_code,
             target_library=migration_delta.library,
             model_call_lines=model_call_lines,
             library_classes=known_library_classes,
+            return_can_resolve=True,
         )
 
-        if not modified:
+        if not modified or not can_resolve:
             residual_files.append(file_rep)
             continue
 
@@ -712,13 +1206,20 @@ def partition_files_for_stage3(
             residual_files.append(file_rep)
             continue
 
-        res_visitor = FileASTVisitor(codemodded_code.splitlines(), migration_delta.library)
+        res_visitor = FileASTVisitor(codemodded_code.splitlines(), migration_delta.library, known_library_classes)
         res_visitor.visit(res_tree)
 
         remaining_deprecated: List[str] = []
         for usage in res_visitor.usages:
             sym_raw = usage.symbol_name.strip()
             sym_lower = sym_raw.lower()
+            base_sym = sym_lower.replace(" (inheritance)", "").replace("(inheritance)", "").rstrip("()")
+            # Safe symbols and user-defined model classes are not deprecated
+            if sym_lower in SAFE_V2_SYMBOLS or base_sym in SAFE_V2_SYMBOLS:
+                continue
+            if base_sym in {k.lower() for k in known_library_classes} and base_sym not in ("basesettings", "genericmodel"):
+                continue
+
             for dep in deprecated_patterns:
                 if dep == sym_lower:
                     remaining_deprecated.append(sym_raw)
@@ -733,6 +1234,8 @@ def partition_files_for_stage3(
                     remaining_deprecated.append(sym_raw)
                     break
                 if dep in ("basesettings", "genericmodel", "root_validator", "validator", "parse_obj_as"):
+                    if dep == "basesettings" and "pydantic_settings" in codemodded_code:
+                        continue
                     if dep in sym_lower:
                         remaining_deprecated.append(sym_raw)
                         break
@@ -744,19 +1247,11 @@ def partition_files_for_stage3(
                 c_unc = unc_sym.strip()
                 if not c_unc:
                     continue
-                unc_lower = c_unc.lower()
-                # Safe constructs in v2
-                if (
-                    unc_lower in SAFE_V2_SYMBOLS
-                    or (unc_lower.endswith(" (inheritance)") and unc_lower.replace(" (inheritance)", "") in SAFE_V2_SYMBOLS)
-                    or "orderrequest" in unc_lower
-                    or "summaryprompt" in unc_lower
-                    or "appsettings" in unc_lower
-                    or "basefinancialmodel" in unc_lower
-                    or unc_lower in ("field()", "basemodel()", "prompt: summaryprompt", "order: orderrequest")
-                ):
+                # Symbol-kind rules: safe constructs, user-defined models, typed parameters
+                if _is_safe_uncovered_symbol(c_unc, known_library_classes, res_visitor):
                     continue
 
+                unc_lower = c_unc.lower()
                 matches_ast = any(
                     unc_lower == u.symbol_name.lower() or unc_lower in u.symbol_name.lower()
                     for u in res_visitor.usages

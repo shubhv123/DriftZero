@@ -1,5 +1,10 @@
 version: '3.8'
 
+# Verification sandboxing requires one of the following execution modes:
+# 1. Nebius Serverless Jobs API (Recommended): Set NEBIUS_SERVERLESS_JOB_ENDPOINT in .env
+# 2. Local Docker Sandbox: Host Docker daemon access (e.g. mount /var/run/docker.sock)
+# 3. Unsafe Local Process Sandbox (Dev fallback): Set ALLOW_UNSAFE_LOCAL_SANDBOX=1
+
 services:
   backend:
     build:
@@ -15,6 +20,7 @@ services:
       - NEBIUS_SERVERLESS_JOB_ENDPOINT=${NEBIUS_SERVERLESS_JOB_ENDPOINT:-}
       - DRIFTZERO_API_KEY=${DRIFTZERO_API_KEY:-}
       - ALLOW_LOCAL_REPOS=${ALLOW_LOCAL_REPOS:-0}
+      - ALLOW_UNSAFE_LOCAL_SANDBOX=${ALLOW_UNSAFE_LOCAL_SANDBOX:-0}
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
     healthcheck:
