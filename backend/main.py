@@ -1,13 +1,13 @@
-# FastAPI entry point, CORS, and SSE live-streaming endpoints
 import asyncio
 import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
-from fastapi import FastAPI, Header, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -23,7 +23,10 @@ from backend.exporters.github_pr_client import create_migration_pr
 from backend.exporters.rules_generator import generate_context_infrastructure_files
 from backend.intelligence.tavily_delta_engine import build_migration_delta
 from backend.intelligence.telemetry_tracker import PipelineTelemetrySummary
-from backend.intelligence.token_factory_router import patch_single_file_via_token_factory
+from backend.intelligence.token_factory_router import (
+    execute_stage2_and_stage3_pipeline,
+    patch_single_file_via_token_factory,
+)
 from backend.schemas.migration_models import Stage3MigrationReport
 from backend.verification.nebius_job_runner import execute_stage4_verification_loop
 
@@ -72,6 +75,99 @@ def _extract_github_token(
     return os.getenv("GITHUB_TOKEN", None)
 
 
+# Security, Rate Limiting & Concurrency controls
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "10"))
+MAX_CONCURRENT_MIGRATIONS = int(os.getenv("MAX_CONCURRENT_MIGRATIONS", "2"))
+CONCURRENCY_STATUS_CODE = int(os.getenv("CONCURRENCY_STATUS_CODE", "429"))
+
+_rate_limit_lock = asyncio.Lock()
+_rate_limit_records: dict[str, list[float]] = {}
+
+_concurrency_semaphore = asyncio.BoundedSemaphore(MAX_CONCURRENT_MIGRATIONS)
+_concurrency_lock = asyncio.Lock()
+
+
+def _check_api_key(
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    api_key_query: Optional[str] = Query(None, alias="api_key"),
+) -> str:
+    """
+    Validates X-API-Key header or api_key query parameter.
+    If DRIFTZERO_API_KEY (or API_KEY) is set in env, it must match.
+    If unset, a non-empty X-API-Key is still required to prevent unauthenticated access.
+    """
+    provided_key = (x_api_key or api_key_query or "").strip()
+    expected_key = (os.getenv("DRIFTZERO_API_KEY") or os.getenv("API_KEY") or "").strip()
+
+    if expected_key:
+        if not provided_key or provided_key != expected_key:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing X-API-Key header",
+            )
+    else:
+        if not provided_key:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Missing X-API-Key header",
+            )
+
+    return provided_key
+
+
+async def _check_rate_limit(request: Request, client_key: str) -> None:
+    """
+    Per-client sliding-window rate limiter (requests per minute).
+    """
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    identifier = f"{client_ip}:{client_key}"
+    now = time.time()
+    window = 60.0
+
+    async with _rate_limit_lock:
+        timestamps = _rate_limit_records.get(identifier, [])
+        timestamps = [t for t in timestamps if now - t < window]
+        if len(timestamps) >= RATE_LIMIT_PER_MINUTE:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Rate limit exceeded: maximum {RATE_LIMIT_PER_MINUTE} requests per minute.",
+            )
+        timestamps.append(now)
+        _rate_limit_records[identifier] = timestamps
+
+
+async def _acquire_concurrency_slot() -> None:
+    """
+    Non-blocking check and acquisition of a concurrency slot for a live migration stream.
+    """
+    async with _concurrency_lock:
+        if _concurrency_semaphore._value <= 0:
+            raise HTTPException(
+                status_code=CONCURRENCY_STATUS_CODE,
+                detail=f"Concurrency cap reached: maximum {MAX_CONCURRENT_MIGRATIONS} simultaneous migrations allowed. Please retry later.",
+            )
+        await _concurrency_semaphore.acquire()
+
+
+def _release_concurrency_slot() -> None:
+    """
+    Safely releases a concurrency slot when stream closes or fails.
+    """
+    try:
+        _concurrency_semaphore.release()
+    except ValueError:
+        pass
+
+
+def _reset_limits_for_testing() -> None:
+    """
+    Utility for tests to reset rate-limit records and concurrency state.
+    """
+    global _rate_limit_records, _concurrency_semaphore
+    _rate_limit_records.clear()
+    _concurrency_semaphore = asyncio.BoundedSemaphore(MAX_CONCURRENT_MIGRATIONS)
+
+
 class MigrationStreamRequest(BaseModel):
     repo_url: str = Field(..., description="GitHub repository URL or local repository path")
     target_library: Optional[str] = Field(None, description="Optional target library override (auto-detected if omitted)")
@@ -101,22 +197,22 @@ async def _run_event_stream_pipeline(
     skip_unverified_pr: bool = False,
     build_log: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
-    # PREPARATION: Workspace Setup
-    if not repo_url or not repo_url.strip():
-        yield _sse_pack("pipeline_error", {
-            "error": "Missing required parameter 'repo_url'. Please provide a GitHub repository URL or local path."
-        })
-        return
-
-    yield _sse_pack("pipeline_init", {
-        "message": f"Cloning and analyzing repository: {repo_url}",
-        "repo_url": repo_url,
-    })
-
     workspace_path = None
     patched_workspace = None
 
     try:
+        # PREPARATION: Workspace Setup
+        if not repo_url or not repo_url.strip():
+            yield _sse_pack("pipeline_error", {
+                "error": "Missing required parameter 'repo_url'. Please provide a GitHub repository URL or local path."
+            })
+            return
+
+        yield _sse_pack("pipeline_init", {
+            "message": f"Cloning and analyzing repository: {repo_url}",
+            "repo_url": repo_url,
+        })
+
         try:
             workspace_path, _ = await asyncio.to_thread(
                 prepare_repo_workspace, repo_url, None, None, github_token
@@ -170,53 +266,21 @@ async def _run_event_stream_pipeline(
 
         # STAGE 2: Tavily Live Delta Engine
         yield _sse_pack("stage_start", {"stage": 2, "title": "Tavily Live Documentation Delta"})
-        migration_delta = await asyncio.to_thread(build_migration_delta, blast_report, build_log)
+
+        # Call execute_stage2_and_stage3_pipeline's parallel patch path instead of the sequential loop
+        migration_delta, s3_report = await asyncio.to_thread(
+            execute_stage2_and_stage3_pipeline,
+            blast_report,
+            patched_workspace,
+            build_log,
+        )
         yield _sse_pack("stage2_complete", migration_delta.to_dict())
         await asyncio.sleep(0.15)
 
         # STAGE 3: LibCST Deterministic Codemods + Nebius Token Factory Smart Router
         yield _sse_pack("stage_start", {"stage": 3, "title": "LibCST Codemods & Nebius Token Factory Smart Router"})
 
-        patches = []
-        telemetry_summary = PipelineTelemetrySummary()
-
-        from backend.core.codemods import partition_files_for_stage3
-        resolved_patches, residual_files = await asyncio.to_thread(
-            partition_files_for_stage3, blast_report, migration_delta
-        )
-
-        # 1. Deterministically resolved files (0 LLM tokens used!)
-        for patch_res in resolved_patches:
-            patches.append(patch_res)
-            telemetry_summary.record_event(patch_res.telemetry)
-            dest_file = patched_workspace / patch_res.relative_path
-            dest_file.parent.mkdir(parents=True, exist_ok=True)
-            dest_file.write_text(patch_res.patched_code, encoding="utf-8")
-
-            yield _sse_pack("stage3_file_patched", {
-                "relative_path": patch_res.relative_path,
-                "assigned_tier": patch_res.assigned_tier,
-                "model_used": patch_res.model_used,
-                "original_code": patch_res.original_code,
-                "unified_diff": patch_res.unified_diff,
-                "patched_code": patch_res.patched_code,
-                "telemetry": patch_res.telemetry.__dict__,
-            })
-
-        # 2. Residual files sent to Nemotron
-        for file_rep in residual_files:
-            patch_res = await asyncio.to_thread(
-                patch_single_file_via_token_factory, file_rep, migration_delta
-            )
-            patches.append(patch_res)
-            telemetry_summary.record_event(patch_res.telemetry)
-
-            # Write upgraded file only if valid
-            if patch_res.status == "SUCCESS" and patch_res.syntax_valid and patch_res.patched_code:
-                dest_file = patched_workspace / patch_res.relative_path
-                dest_file.parent.mkdir(parents=True, exist_ok=True)
-                dest_file.write_text(patch_res.patched_code, encoding="utf-8")
-
+        for patch_res in s3_report.patches:
             yield _sse_pack("stage3_file_patched", {
                 "relative_path": patch_res.relative_path,
                 "assigned_tier": patch_res.assigned_tier,
@@ -238,16 +302,6 @@ async def _run_event_stream_pipeline(
                 "manifests_updated": manifest_res.manifests_updated,
             })
 
-        s3_report = Stage3MigrationReport(
-            total_files_patched=len(patches),
-            super_files_count=telemetry_summary.super_calls,
-            ultra_files_count=telemetry_summary.ultra_calls,
-            total_latency_ms=round(telemetry_summary.total_latency_ms, 2),
-            total_actual_cost_usd=round(telemetry_summary.total_actual_cost_usd, 6),
-            total_hypothetical_ultra_cost_usd=round(telemetry_summary.total_hypothetical_ultra_cost_usd, 6),
-            total_cost_savings_pct=telemetry_summary.savings_percentage,
-            patches=patches,
-        )
         yield _sse_pack("stage3_complete", s3_report.to_dict())
         await asyncio.sleep(0.15)
 
@@ -256,6 +310,12 @@ async def _run_event_stream_pipeline(
         stage4_report = await asyncio.to_thread(
             execute_stage4_verification_loop, patched_workspace, migration_delta, 3, workspace_path
         )
+
+        # If any patch is FAILED, set final_status="FAILED" and open only a draft PR (or none)
+        if any(p.status == "FAILED" for p in s3_report.patches):
+            stage4_report.final_status = "FAILED"
+            print("⚠️ [Pipeline Notice] One or more Stage 3 patches failed. Overriding final_status to 'FAILED'.", flush=True)
+
         yield _sse_pack("stage4_complete", stage4_report.to_dict())
         await asyncio.sleep(0.15)
 
@@ -296,6 +356,7 @@ async def _run_event_stream_pipeline(
         yield _sse_pack("pipeline_error", {"error": f"Pipeline stage error: {exc}"})
         return
     finally:
+        _release_concurrency_slot()
         # Delete ephemeral workspaces when done
         if workspace_path:
             cleanup_workspace(workspace_path)
@@ -303,10 +364,17 @@ async def _run_event_stream_pipeline(
 
 @app.post("/api/migrate/stream")
 async def stream_migration_pipeline_post(
+    request: Request,
     body: MigrationStreamRequest,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    api_key: Optional[str] = Query(None, alias="api_key"),
     x_github_token: Optional[str] = Header(None, alias="X-GitHub-Token"),
     authorization: Optional[str] = Header(None, alias="Authorization"),
 ) -> StreamingResponse:
+    client_key = _check_api_key(x_api_key=x_api_key, api_key_query=api_key)
+    await _check_rate_limit(request, client_key)
+    await _acquire_concurrency_slot()
+
     token = _extract_github_token(
         x_github_token=x_github_token,
         authorization=authorization,
@@ -328,6 +396,7 @@ async def stream_migration_pipeline_post(
 
 @app.get("/api/migrate/stream")
 async def stream_migration_pipeline_get(
+    request: Request,
     repo_url: str = Query(..., description="GitHub repository URL or local repository path"),
     target_library: Optional[str] = Query(None, description="Optional target library override (auto-detected if omitted)"),
     target_version: Optional[str] = Query(None, description="Optional target version override (auto-detected if omitted)"),
@@ -335,9 +404,15 @@ async def stream_migration_pipeline_get(
     github_token: Optional[str] = Query(None, description="Optional GitHub token (deprecated: prefer X-GitHub-Token header or POST body)"),
     skip_unverified_pr: Optional[bool] = Query(False, description="Whether to skip PR creation when Stage 4 parity check fails"),
     build_log: Optional[str] = Query(None, description="Optional build or test failure log"),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    api_key: Optional[str] = Query(None, alias="api_key"),
     x_github_token: Optional[str] = Header(None, alias="X-GitHub-Token"),
     authorization: Optional[str] = Header(None, alias="Authorization"),
 ) -> StreamingResponse:
+    client_key = _check_api_key(x_api_key=x_api_key, api_key_query=api_key)
+    await _check_rate_limit(request, client_key)
+    await _acquire_concurrency_slot()
+
     token = _extract_github_token(
         x_github_token=x_github_token,
         authorization=authorization,
@@ -399,34 +474,12 @@ if __name__ == "__main__":
             blast.old_version = source_ver_arg
         print(f"[Stage 1] Scanned: {blast.total_files_scanned} files | Affected: {blast.affected_files_count} files ({blast.scan_duration_ms} ms)")
 
-        # 2. Stage 2
-        delta = build_migration_delta(blast)
+        # 2 & 3. Stage 2 & Stage 3: Parallel Patch Path via execute_stage2_and_stage3_pipeline
+        delta, s3_report = execute_stage2_and_stage3_pipeline(blast, patched_ws)
         print(f"[Stage 2] Tavily Grounded: {len(delta.rules)} rules synthesized | Citations: {len(delta.citations)}")
-
-        # 3. Stage 3: LibCST Codemods + Nemotron
-        telemetry = PipelineTelemetrySummary()
-        patches = []
-        from backend.core.codemods import partition_files_for_stage3
-        resolved_patches, residual_files = partition_files_for_stage3(blast, delta)
-
-        for p in resolved_patches:
-            patches.append(p)
-            telemetry.record_event(p.telemetry)
-            dest = patched_ws / p.relative_path
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(p.patched_code, encoding="utf-8")
-
-        for f in residual_files:
-            p = patch_single_file_via_token_factory(f, delta)
-            patches.append(p)
-            telemetry.record_event(p.telemetry)
-            if p.status == "SUCCESS" and p.syntax_valid and p.patched_code:
-                dest = patched_ws / p.relative_path
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_text(p.patched_code, encoding="utf-8")
+        print(f"[Stage 3] Patched: {len(s3_report.patches)} files | Saved: {s3_report.total_cost_savings_pct}% token cost | Codemods: {s3_report.codemod_files_count}")
 
         manifest_res = update_manifest_version(patched_ws, lib_arg, ver_arg)
-        print(f"[Stage 3] Patched: {len(patches)} files | Saved: {telemetry.savings_percentage}% token cost")
         if manifest_res.conflicts:
             for conf in manifest_res.conflicts:
                 print(f"⚠️ [Manifest Conflict] {conf}")
@@ -436,6 +489,10 @@ if __name__ == "__main__":
 
         # 4. Stage 4: Parity Sandbox
         s4 = execute_stage4_verification_loop(patched_ws, delta, max_retries=3, baseline_repo_dir=ws_dir)
+        if any(p.status == "FAILED" for p in s3_report.patches):
+            s4.final_status = "FAILED"
+            print("⚠️ [Pipeline Notice] One or more Stage 3 patches failed. Overriding final_status to 'FAILED'.", flush=True)
+
         for att in s4.attempts:
             status_icon = "✅ PASSED" if att.exit_code == 0 else "❌ FAILED"
             print(f"[Stage 4 | Attempt #{att.attempt_number}] {att.job_id} -> {status_icon} | Passed: {att.passed_count}, Failed: {att.failed_count}")

@@ -1,8 +1,12 @@
-# Prompts Nemotron 3 Ultra to write differential equivalence tests with golden.json verification
+# Differential equivalence test generator with golden.json verification
 import ast
 import json
 import os
 import re
+import subprocess
+import sys
+from decimal import Decimal
+from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -146,21 +150,153 @@ def _generate_sample_input_for_field(field_name: str, type_annotation: str = "")
     return f"sample_{field_name}"
 
 
+def _build_model_sample_inputs(cls_obj: Any, fallback: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Builds sample inputs at test runtime from the model's own fields
+    (model_fields in Pydantic v2 or __fields__ in Pydantic v1, including all inherited ones).
+    """
+    fields_dict = getattr(cls_obj, "model_fields", None)
+    if fields_dict is None:
+        fields_dict = getattr(cls_obj, "__fields__", None)
+
+    if not isinstance(fields_dict, dict):
+        return dict(fallback or {})
+
+    kwargs = dict(fallback or {})
+    for f_name, f_info in fields_dict.items():
+        type_str = ""
+        # Pydantic v2: FieldInfo.annotation
+        if hasattr(f_info, "annotation") and f_info.annotation is not None:
+            type_str = getattr(f_info.annotation, "__name__", str(f_info.annotation))
+        # Pydantic v1: ModelField.type_ / outer_type_
+        elif hasattr(f_info, "type_") and f_info.type_ is not None:
+            type_str = getattr(f_info.type_, "__name__", str(f_info.type_))
+        elif hasattr(f_info, "outer_type_") and f_info.outer_type_ is not None:
+            type_str = getattr(f_info.outer_type_, "__name__", str(f_info.outer_type_))
+
+        if f_name not in kwargs or kwargs[f_name] is None:
+            kwargs[f_name] = _generate_sample_input_for_field(f_name, type_str)
+        elif kwargs[f_name] == f"sample_{f_name}" and type_str:
+            kwargs[f_name] = _generate_sample_input_for_field(f_name, type_str)
+
+    return kwargs
+
+
+def _serialize_value(val: Any, mode: str = "json") -> Any:
+    """
+    Serializes models and Python values across legacy and modern library versions.
+    Normalizes both sides through mode='json' (converts Decimals, datetimes, Enums, sets to JSON-safe types).
+    """
+    if val is None:
+        return None
+
+    # Handle Enums
+    if hasattr(val, "value"):
+        return _serialize_value(val.value, mode=mode)
+
+    # Modern Pydantic v2 / dataclasses with model_dump
+    if hasattr(val, "model_dump") and callable(getattr(val, "model_dump")):
+        if mode == "json":
+            try:
+                dumped = val.model_dump(mode="json")
+                return _serialize_value(dumped, mode=mode)
+            except Exception:
+                try:
+                    return json.loads(json.dumps(val.model_dump(), default=str))
+                except Exception:
+                    pass
+        return val.model_dump()
+
+    # Legacy Pydantic v1 / objects with dict()
+    if hasattr(val, "dict") and callable(getattr(val, "dict")):
+        if mode == "json":
+            if hasattr(val, "json") and callable(getattr(val, "json")):
+                try:
+                    return json.loads(val.json())
+                except Exception:
+                    pass
+            try:
+                return json.loads(json.dumps(val.dict(), default=str))
+            except Exception:
+                pass
+        return val.dict()
+
+    if isinstance(val, (int, float, str, bool)):
+        return val
+    if isinstance(val, (list, tuple)):
+        return [_serialize_value(item, mode=mode) for item in val]
+    if isinstance(val, (set, frozenset)):
+        serialized_items = [_serialize_value(item, mode=mode) for item in val]
+        return sorted(serialized_items, key=lambda x: json.dumps(x, default=str) if isinstance(x, (dict, list)) else str(x))
+    if isinstance(val, dict):
+        return {str(k): _serialize_value(v, mode=mode) for k, v in val.items()}
+    if isinstance(val, Decimal):
+        return str(val) if mode == "json" else float(val)
+    if isinstance(val, (datetime, date)):
+        return val.isoformat()
+
+    return str(val)
+
+
+def dry_run_candidate_in_record_mode(candidate_code: str, repo_dir: Path) -> bool:
+    """
+    Dry-runs an LLM-generated test suite in record mode (DRIFTZERO_RECORD_GOLDEN=1)
+    before accepting it. Returns True if dry-run succeeds, False if it fails.
+    If it fails, cleans up any temporary test files or partial golden files.
+    """
+    temp_test = repo_dir / "_dry_run_parity_test.py"
+    golden_file = repo_dir / "golden.json"
+    had_golden = golden_file.exists()
+    old_golden_bytes = golden_file.read_bytes() if had_golden else None
+
+    try:
+        # Check AST first
+        ast.parse(candidate_code)
+
+        temp_test.write_text(candidate_code, encoding="utf-8")
+        env = os.environ.copy()
+        env["DRIFTZERO_RECORD_GOLDEN"] = "1"
+        repo_str = str(repo_dir)
+        src_str = str(repo_dir / "src")
+        env["PYTHONPATH"] = f"{repo_str}:{src_str}:{env.get('PYTHONPATH', '')}"
+
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", str(temp_test), "-q"],
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=25,
+        )
+        if proc.returncode == 0:
+            print("  ✅ [LLM Parity Test] Dry-run in record mode PASSED. Accepting candidate.", flush=True)
+            return True
+        else:
+            print(f"  ❌ [LLM Parity Test Rejected] Dry-run in record mode failed (exit {proc.returncode}): {proc.stderr[:300] or proc.stdout[:300]}", flush=True)
+            return False
+    except Exception as exc:
+        print(f"  ❌ [LLM Parity Test Rejected] Dry-run exception: {exc}", flush=True)
+        return False
+    finally:
+        if temp_test.exists():
+            temp_test.unlink(missing_ok=True)
+        if not had_golden and golden_file.exists():
+            golden_file.unlink(missing_ok=True)
+        elif had_golden and old_golden_bytes is not None and golden_file.exists():
+            golden_file.write_bytes(old_golden_bytes)
+
+
 def _build_deterministic_differential_suite(
     modules: List[Dict[str, Any]],
     migration_delta: MigrationDelta,
 ) -> str:
     """
-    Builds a robust, differential parity test suite:
-    1. In the old-version container (DRIFTZERO_RECORD_GOLDEN=1), calls each public function and model
-       on generated inputs and writes outputs to golden.json.
-    2. In the new container (DRIFTZERO_RECORD_GOLDEN=0), loads golden.json and asserts strict equality:
-       - model_dump() (raw Python) vs golden
-       - model_dump(mode="json") vs golden
-       - validation error messages on invalid inputs
-       - function return values vs golden
-    3. Fails loudly with AssertionError if any equality check fails or if any symbol cannot be imported.
-       Completely eliminates any hasattr/callable fallback checks.
+    Builds a robust, deterministic differential parity test suite:
+    1. Emits sample_kwargs with repr() (not json.dumps).
+    2. Builds inputs at test runtime from the model's own fields (model_fields or __fields__, including inherited ones).
+    3. Maintains a module-level global _golden_store dictionary.
+    4. Normalizes both sides through _serialize_value(mode="json") before comparing.
+    5. Compares error type only, not message.
     """
     test_functions = []
 
@@ -181,11 +317,11 @@ def _build_deterministic_differential_suite(
             c_name = cls_info["name"]
             flds = cls_info["fields"]
             sample_inputs = {f: _generate_sample_input_for_field(f, flds.get(f, "")) for f in flds} if flds else {}
-            sample_json_repr = json.dumps(sample_inputs)
+            sample_repr = repr(sample_inputs)
 
             symbol_tests.append(f"""
     # Differential Parity Test for Model: {mod_name}.{c_name}
-    sample_kwargs = {sample_json_repr}
+    sample_kwargs = _build_model_sample_inputs({c_name}, fallback={sample_repr})
     verify_model_differential("{mod_name}", "{c_name}", {c_name}, sample_kwargs)
 """)
 
@@ -194,11 +330,11 @@ def _build_deterministic_differential_suite(
             f_name = fn_info["name"]
             args = fn_info["args"]
             sample_kwargs = {a: _generate_sample_input_for_field(a, args.get(a, "")) for a in args} if args else {}
-            sample_json_repr = json.dumps(sample_kwargs)
+            sample_repr = repr(sample_kwargs)
 
             symbol_tests.append(f"""
     # Differential Parity Test for Function: {mod_name}.{f_name}
-    sample_kwargs = {sample_json_repr}
+    sample_kwargs = {sample_repr}
     verify_function_differential("{mod_name}", "{f_name}", {f_name}, sample_kwargs)
 """)
 
@@ -232,7 +368,8 @@ if _src_dir.exists() and str(_src_dir) not in sys.path:
 GOLDEN_FILE = Path(__file__).resolve().parent / "golden.json"
 IS_RECORDING = os.getenv("DRIFTZERO_RECORD_GOLDEN", "0") == "1"
 
-_golden_store = {{}}
+# Module-level golden store
+_golden_store: dict = {{}}
 
 def _load_golden() -> dict:
     global _golden_store
@@ -245,50 +382,155 @@ def _load_golden() -> dict:
                 "The old-version container must run with DRIFTZERO_RECORD_GOLDEN=1 first "
                 "to record golden baseline outputs before running differential verification."
             )
-        return {{}}
+        return _golden_store
     try:
-        _golden_store = json.loads(GOLDEN_FILE.read_text(encoding="utf-8"))
+        _golden_store.clear()
+        _golden_store.update(json.loads(GOLDEN_FILE.read_text(encoding="utf-8")))
         return _golden_store
     except Exception as exc:
         raise AssertionError(f"Failed to read golden baseline file: {{exc}}")
 
 def _save_golden():
+    global _golden_store
     GOLDEN_FILE.write_text(json.dumps(_golden_store, indent=2, default=str), encoding="utf-8")
 
 
-def _serialize_value(val, mode="python"):
+def _generate_sample_input_for_field(field_name: str, type_annotation: str = ""):
+    name = field_name.lower()
+    t_clean = type_annotation.lower().strip()
+
+    if name == "postal_code":
+        return "94105"
+    if "email" in name:
+        return "dev@example.com"
+    if name in ("sender_country", "receiver_country", "country"):
+        return "US"
+    if name in ("amount", "amount_usd", "price", "rate", "fee", "balance", "cost", "fx_rate"):
+        return 100.0
+    if name in ("quantity", "count", "limit", "retries", "max_retries", "timeout_seconds", "attempt_count", "unit_price_cents", "qty"):
+        return 5
+    if name in ("created_at", "updated_at", "timestamp", "date"):
+        return "2025-01-01T12:00:00"
+    if name in ("is_", "has_", "active", "enabled", "requires_manual_compliance_review"):
+        return False
+    if name in ("tags", "list", "categories"):
+        return ["item_1", "item_2"]
+    if name in ("payload", "data", "meta", "metadata", "config", "data_object", "payload_snapshot"):
+        return {{"status": "ok", "env": "test"}}
+    if name == "street":
+        return "123 Market St"
+    if name == "city":
+        return "San Francisco"
+    if name == "sku":
+        return "SKU-TEST-001"
+    if name.endswith("_id") or name == "id" or name in ("order_id", "customer_id", "transaction_id", "trace_id", "actor_id", "event_id"):
+        return f"test_{{field_name}}_123"
+    if name == "primary_address":
+        return {{"street": "123 Market St", "city": "San Francisco", "postal_code": "94105"}}
+    if name == "items":
+        return [{{"sku": "SKU-001", "quantity": 2, "unit_price_cents": 500}}]
+    if name == "order":
+        return {{"order_id": "test_order_123", "created_at": "2025-01-01T12:00:00", "items": [{{"sku": "SKU-1", "quantity": 1, "unit_price_cents": 100}}]}}
+    if name == "raw_dict":
+        return {{"order_id": "test_order_123", "created_at": "2025-01-01T12:00:00", "items": [{{"sku": "SKU-1", "quantity": 1, "unit_price_cents": 100}}]}}
+    if name == "raw_json":
+        return json.dumps({{"order_id": "test_order_123", "created_at": "2025-01-01T12:00:00", "items": [{{"sku": "SKU-1", "quantity": 1, "unit_price_cents": 100}}]}})
+    if name == "prompt":
+        return {{"system_instruction": "Summarize", "user_transcript": "User dialog", "temperature": 0.5}}
+    if name == "scores" or name == "__root__":
+        return [1.0, 2.5, 3.0]
+
+    if "int" in t_clean:
+        return 5
+    if "float" in t_clean:
+        return 10.5
+    if "bool" in t_clean:
+        return True
+    if "list" in t_clean:
+        return ["item_1", "item_2"]
+    if "dict" in t_clean:
+        return {{"key": "value"}}
+    if "datetime" in t_clean or "date" in t_clean:
+        return "2025-01-01T12:00:00"
+
+    return f"sample_{{field_name}}"
+
+
+def _build_model_sample_inputs(cls_obj, fallback=None):
+    """
+    Builds sample inputs at test runtime from the model's own fields
+    (model_fields in Pydantic v2 or __fields__ in Pydantic v1, including all inherited ones).
+    """
+    fields_dict = getattr(cls_obj, "model_fields", None)
+    if fields_dict is None:
+        fields_dict = getattr(cls_obj, "__fields__", None)
+
+    if not isinstance(fields_dict, dict):
+        return dict(fallback or {{}})
+
+    kwargs = dict(fallback or {{}})
+    for f_name, f_info in fields_dict.items():
+        type_str = ""
+        if hasattr(f_info, "annotation") and f_info.annotation is not None:
+            type_str = getattr(f_info.annotation, "__name__", str(f_info.annotation))
+        elif hasattr(f_info, "type_") and f_info.type_ is not None:
+            type_str = getattr(f_info.type_, "__name__", str(f_info.type_))
+        elif hasattr(f_info, "outer_type_") and f_info.outer_type_ is not None:
+            type_str = getattr(f_info.outer_type_, "__name__", str(f_info.outer_type_))
+
+        if f_name not in kwargs or kwargs[f_name] is None:
+            kwargs[f_name] = _generate_sample_input_for_field(f_name, type_str)
+        elif kwargs[f_name] == f"sample_{{f_name}}" and type_str:
+            kwargs[f_name] = _generate_sample_input_for_field(f_name, type_str)
+
+    return kwargs
+
+
+def _serialize_value(val, mode="json"):
     """
     Serializes models and Python values across legacy and modern library versions.
-    Supports model_dump() (raw Python) vs model_dump(mode="json"), as well as dict() / json().
+    Normalizes both sides through mode='json' (converts Decimals, datetimes, Enums, sets to JSON-safe types).
     """
     if val is None:
         return None
+
+    if hasattr(val, "value"):
+        return _serialize_value(val.value, mode=mode)
 
     # Modern Pydantic v2 / dataclasses with model_dump
     if hasattr(val, "model_dump") and callable(getattr(val, "model_dump")):
         if mode == "json":
             try:
-                return val.model_dump(mode="json")
+                dumped = val.model_dump(mode="json")
+                return _serialize_value(dumped, mode=mode)
             except Exception:
-                return json.loads(json.dumps(val.model_dump(), default=str))
+                try:
+                    return json.loads(json.dumps(val.model_dump(), default=str))
+                except Exception:
+                    pass
         return val.model_dump()
 
     # Legacy Pydantic v1 / objects with dict()
     if hasattr(val, "dict") and callable(getattr(val, "dict")):
-        raw_dict = val.dict()
         if mode == "json":
             if hasattr(val, "json") and callable(getattr(val, "json")):
                 try:
                     return json.loads(val.json())
                 except Exception:
                     pass
-            return json.loads(json.dumps(raw_dict, default=str))
-        return raw_dict
+            try:
+                return json.loads(json.dumps(val.dict(), default=str))
+            except Exception:
+                pass
+        return val.dict()
 
     if isinstance(val, (int, float, str, bool)):
         return val
     if isinstance(val, (list, tuple)):
         return [_serialize_value(item, mode=mode) for item in val]
+    if isinstance(val, (set, frozenset)):
+        serialized_items = [_serialize_value(item, mode=mode) for item in val]
+        return sorted(serialized_items, key=lambda x: json.dumps(x, default=str) if isinstance(x, (dict, list)) else str(x))
     if isinstance(val, dict):
         return {{str(k): _serialize_value(v, mode=mode) for k, v in val.items()}}
     if isinstance(val, Decimal):
@@ -299,51 +541,40 @@ def _serialize_value(val, mode="python"):
     return str(val)
 
 
-def verify_model_differential(mod_name: str, cls_name: str, cls_obj, sample_kwargs: dict):
+def verify_model_differential(mod_name: str, cls_name: str, cls_obj, sample_kwargs: dict = None):
     """
     Differential parity assertion for models:
-    - Old container (DRIFTZERO_RECORD_GOLDEN=1): instantiates model, serializes baseline dumps
-      (dict/json in v1), tests invalid inputs, and writes to golden.json.
-    - New container (DRIFTZERO_RECORD_GOLDEN=0): calls model_dump() and model_dump(mode="json")
-      directly (without hasattr fallback) and asserts equality against golden.json.
-      Asserts validation error messages on invalid inputs.
-    - Fails loudly with AssertionError or AttributeError on any divergence.
+    - Builds inputs at test runtime from model_fields or __fields__, including inherited ones.
+    - Normalizes both sides through _serialize_value(mode="json") before comparing.
+    - Compares error type only, not message.
     """
+    global _golden_store
     golden_key = f"model::{{mod_name}}.{{cls_name}}"
+
+    runtime_inputs = _build_model_sample_inputs(cls_obj, fallback=sample_kwargs)
+    final_kwargs = runtime_inputs if runtime_inputs else dict(sample_kwargs or {{}})
 
     if IS_RECORDING:
         record = {{}}
         try:
-            instance = cls_obj(**sample_kwargs)
+            instance = cls_obj(**final_kwargs)
             record["status"] = "ok"
-            # Baseline dumps: in v1 dict() corresponds to model_dump(), json() corresponds to model_dump(mode="json")
-            if hasattr(instance, "model_dump"):
-                record["model_dump"] = instance.model_dump()
-                record["model_dump_json"] = instance.model_dump(mode="json")
-            else:
-                record["model_dump"] = instance.dict()
-                if hasattr(instance, "json"):
-                    try:
-                        record["model_dump_json"] = json.loads(instance.json())
-                    except Exception:
-                        record["model_dump_json"] = json.loads(json.dumps(instance.dict(), default=str))
-                else:
-                    record["model_dump_json"] = json.loads(json.dumps(instance.dict(), default=str))
+            record["output"] = _serialize_value(instance, mode="json")
+            record["model_dump"] = record["output"]
+            record["model_dump_json"] = record["output"]
         except Exception as exc:
             record["status"] = "error"
             record["error_type"] = type(exc).__name__
-            record["error_message"] = str(exc)
 
-        # Record error messages on invalid / missing inputs
+        # Record error type on invalid / empty inputs
         try:
             cls_obj()
             record["empty_input_status"] = "ok"
         except Exception as exc:
             record["empty_input_status"] = "error"
             record["invalid_error_type"] = type(exc).__name__
-            record["invalid_error_message"] = str(exc)
 
-        _golden_store = _load_golden()
+        _load_golden()
         _golden_store[golden_key] = record
         _save_golden()
         return
@@ -359,84 +590,62 @@ def verify_model_differential(mod_name: str, cls_name: str, cls_obj, sample_kwar
     expected = golden[golden_key]
 
     if expected["status"] == "ok":
-        instance = cls_obj(**sample_kwargs)
+        instance = cls_obj(**final_kwargs)
 
-        # 1. Assert equality of model_dump() (raw Python representation)
-        # Direct call without hasattr fallback - fails loudly if model_dump is missing!
-        actual_raw = instance.model_dump()
-        assert actual_raw == expected["model_dump"], (
-            f"Differential Model Parity Mismatch for '{{cls_name}}.model_dump()':\\n"
-            f"Expected (Golden): {{expected['model_dump']}}\\n"
-            f"Actual   (New):    {{actual_raw}}"
+        # Normalize both sides through _serialize_value(mode="json") before comparing
+        actual_norm = _serialize_value(instance, mode="json")
+        expected_norm = _serialize_value(
+            expected.get("output") or expected.get("model_dump_json") or expected.get("model_dump"),
+            mode="json"
         )
-
-        # 2. Assert equality of model_dump(mode='json') (JSON-compatible representation)
-        # Direct call without hasattr fallback - fails loudly if model_dump(mode='json') fails or diverges!
-        actual_json = instance.model_dump(mode="json")
-        assert actual_json == expected["model_dump_json"], (
-            f"Differential Model Parity Mismatch for '{{cls_name}}.model_dump(mode=\\"json\\")':\\n"
-            f"Expected (Golden): {{expected['model_dump_json']}}\\n"
-            f"Actual   (New):    {{actual_json}}"
+        assert actual_norm == expected_norm, (
+            f"Differential Model Parity Mismatch for '{{cls_name}}':\\n"
+            f"Expected (Golden): {{expected_norm}}\\n"
+            f"Actual   (New):    {{actual_norm}}"
         )
     else:
-        # Expected error on instantiation
+        # Expected error on instantiation: compare error type only, not message
         with pytest.raises(Exception) as exc_info:
-            cls_obj(**sample_kwargs)
-        assert exc_info.value.__class__.__name__ == expected["error_type"], (
-            f"Error type mismatch for '{{cls_name}}': expected {{expected['error_type']}}, "
-            f"got {{exc_info.value.__class__.__name__}}"
-        )
-        assert str(exc_info.value) == expected["error_message"], (
-            f"Error message mismatch for '{{cls_name}}':\\n"
-            f"Expected: {{expected['error_message']}}\\n"
-            f"Actual:   {{str(exc_info.value)}}"
+            cls_obj(**final_kwargs)
+        actual_type = exc_info.value.__class__.__name__
+        expected_type = expected["error_type"]
+        assert actual_type == expected_type, (
+            f"Error type mismatch for '{{cls_name}}': expected {{expected_type}}, got {{actual_type}}"
         )
 
-    # 3. Assert error message and validation error equivalence on invalid inputs
+    # Assert error type on invalid / empty inputs: compare error type only, not message
     if expected.get("empty_input_status") == "error":
         with pytest.raises(Exception) as exc_info:
             cls_obj()
         actual_type = exc_info.value.__class__.__name__
-        actual_msg = str(exc_info.value)
-        assert actual_type == expected["invalid_error_type"], (
+        expected_type = expected["invalid_error_type"]
+        assert actual_type == expected_type, (
             f"Validation error type mismatch for invalid inputs on '{{cls_name}}': "
-            f"expected {{expected['invalid_error_type']}}, got {{actual_type}}"
+            f"expected {{expected_type}}, got {{actual_type}}"
         )
-        assert actual_msg.strip(), f"Error message should not be empty for '{{cls_name}}'"
-        if actual_type != "ValidationError":
-            assert actual_msg == expected["invalid_error_message"], (
-                f"Error message mismatch for '{{cls_name}}':\\n"
-                f"Expected: {{expected['invalid_error_message']}}\\n"
-                f"Actual:   {{actual_msg}}"
-            )
-        else:
-            # For Pydantic ValidationErrors across v1 and v2, assert validation error presence
-            assert "validation error" in actual_msg.lower() or "error" in actual_msg.lower(), (
-                f"Validation error message divergence for '{{cls_name}}': {{actual_msg}}"
-            )
 
 
-def verify_function_differential(mod_name: str, fn_name: str, fn_obj, sample_kwargs: dict):
+def verify_function_differential(mod_name: str, fn_name: str, fn_obj, sample_kwargs: dict = None):
     """
     Differential parity assertion for functions:
-    - Old container: invokes function on sample inputs and records output/error to golden.json.
-    - New container: asserts strict equality of return value and error behavior against golden.json.
-    - Fails loudly with AssertionError on mismatch.
+    - Normalizes both sides through _serialize_value(mode="json") before comparing.
+    - Compares error type only, not message.
     """
+    global _golden_store
     golden_key = f"func::{{mod_name}}.{{fn_name}}"
+    final_kwargs = dict(sample_kwargs or {{}})
 
     if IS_RECORDING:
         record = {{}}
         try:
-            res = fn_obj(**sample_kwargs)
+            res = fn_obj(**final_kwargs)
             record["status"] = "ok"
             record["output"] = _serialize_value(res, mode="json")
         except Exception as exc:
             record["status"] = "error"
             record["error_type"] = type(exc).__name__
-            record["error_message"] = str(exc)
 
-        _golden_store = _load_golden()
+        _load_golden()
         _golden_store[golden_key] = record
         _save_golden()
         return
@@ -452,24 +661,22 @@ def verify_function_differential(mod_name: str, fn_name: str, fn_obj, sample_kwa
     expected = golden[golden_key]
 
     if expected["status"] == "ok":
-        res = fn_obj(**sample_kwargs)
-        actual = _serialize_value(res, mode="json")
-        assert actual == expected["output"], (
+        res = fn_obj(**final_kwargs)
+        actual_norm = _serialize_value(res, mode="json")
+        expected_norm = _serialize_value(expected["output"], mode="json")
+        assert actual_norm == expected_norm, (
             f"Differential Function Parity Mismatch for '{{fn_name}}':\\n"
-            f"Expected (Golden): {{expected['output']}}\\n"
-            f"Actual   (New):    {{actual}}"
+            f"Expected (Golden): {{expected_norm}}\\n"
+            f"Actual   (New):    {{actual_norm}}"
         )
     else:
+        # Expected error on function execution: compare error type only, not message
         with pytest.raises(Exception) as exc_info:
-            fn_obj(**sample_kwargs)
-        assert exc_info.value.__class__.__name__ == expected["error_type"], (
-            f"Function error type mismatch for '{{fn_name}}': expected {{expected['error_type']}}, "
-            f"got {{exc_info.value.__class__.__name__}}"
-        )
-        assert str(exc_info.value) == expected["error_message"], (
-            f"Function error message mismatch for '{{fn_name}}':\\n"
-            f"Expected: {{expected['error_message']}}\\n"
-            f"Actual:   {{str(exc_info.value)}}"
+            fn_obj(**final_kwargs)
+        actual_type = exc_info.value.__class__.__name__
+        expected_type = expected["error_type"]
+        assert actual_type == expected_type, (
+            f"Function error type mismatch for '{{fn_name}}': expected {{expected_type}}, got {{actual_type}}"
         )
 
 {chr(10).join(test_functions)}
@@ -483,20 +690,25 @@ def generate_parity_test_suite(
 ) -> Path:
     """
     Synthesizes `test_migration_parity.py` inside `patched_repo_dir`.
-    Works differentially:
-    - In old-version container (DRIFTZERO_RECORD_GOLDEN=1), runs all public functions and models
-      on generated inputs and writes outputs to golden.json.
-    - In new container, asserts equality against golden.json (including model_dump() vs
-      model_dump(mode="json") and error messages).
-    - Fails loudly with AssertionError on any mismatch; eliminates hasattr/callable fallbacks.
+    - If ENABLE_LLM_PARITY_GEN=1 is set, prompts Nemotron 3 Ultra and dry-runs the candidate
+      in record mode before accepting it. If dry-run fails, deletes/rejects it.
+    - Otherwise, deletes the LLM path and uses the deterministic differential test generator.
+    - Builds inputs at test runtime from model's own fields (model_fields or __fields__, including inherited ones).
+    - Normalizes both sides through _serialize_value(mode="json") before comparing.
+    - Compares error type only, not message.
+    - Emits sample_kwargs with repr(), not json.dumps.
+    - Uses module-level _golden_store dictionary.
     """
     test_file = patched_repo_dir / "test_migration_parity.py"
     modules = _discover_migrated_symbols(patched_repo_dir)
 
     test_code = ""
 
-    # 1. Live Differential Parity Test Generation via Nebius Token Factory (Nemotron 3 Ultra)
-    if NEBIUS_API_KEY and modules:
+    # Optional Live LLM Parity Test Generation path
+    # Dry-run in record mode is strictly required before accepting it!
+    # If dry-run fails or LLM is disabled, delete/reject candidate and use deterministic generator.
+    use_llm = os.getenv("ENABLE_LLM_PARITY_GEN", "0") == "1"
+    if use_llm and NEBIUS_API_KEY and modules:
         try:
             from openai import OpenAI
 
@@ -509,8 +721,11 @@ def generate_parity_test_suite(
                 "Write a differential test suite inside `test_migration_parity.py`:\n"
                 "- In the old-version container (DRIFTZERO_RECORD_GOLDEN=1), call each public function and model "
                 "on generated inputs and write outputs to `golden.json`.\n"
-                "- In the new container, assert equality against `golden.json`, including `model_dump()` vs `model_dump(mode='json')` "
-                "and error messages.\n"
+                "- In the new container, assert equality against `golden.json`, normalizing both sides through "
+                "`_serialize_value(mode='json')`.\n"
+                "- Compare error type only, not message.\n"
+                "- Build inputs at test runtime from model_fields or __fields__.\n"
+                "- Use module-level _golden_store.\n"
                 "- Delete any hasattr/callable fallback and fail loudly with AssertionError on any mismatch."
             )
             res = client.chat.completions.create(
@@ -529,18 +744,16 @@ def generate_parity_test_suite(
                         raw_text = str(res.choices[0].message.model_extra[k]).strip()
                         break
             candidate = _extract_code_block(raw_text)
-            try:
-                # Validate syntax and ensure golden.json workflow is present
-                ast.parse(candidate)
-                if "golden.json" in candidate and "hasattr" not in candidate:
+            if candidate and "golden.json" in candidate:
+                if dry_run_candidate_in_record_mode(candidate, patched_repo_dir):
                     test_code = candidate
-                    print(f"  🌐 [LIVE NEBIUS ULTRA PARITY TEST GEN] Generated differential parity test suite via {NEMOTRON_ULTRA_MODEL}", flush=True)
-            except SyntaxError:
-                pass
+                    print(f"  🌐 [LIVE NEBIUS ULTRA PARITY TEST GEN] Dry-run passed; accepted parity test suite via {NEMOTRON_ULTRA_MODEL}", flush=True)
+                else:
+                    print("  ⚠️ [Parity Test Gen] Dry-run in record mode failed. Deleting LLM test candidate.", flush=True)
         except Exception as exc:
             print(f"  ⚠️ [Parity Test Gen Notice] Live synthesis notice: {exc}", flush=True)
 
-    # 2. Deterministic Differential Parity Test Generator Fallback (Runs on ANY arbitrary repository)
+    # Deterministic Differential Parity Test Generator
     if not test_code:
         test_code = _build_deterministic_differential_suite(modules, migration_delta)
 

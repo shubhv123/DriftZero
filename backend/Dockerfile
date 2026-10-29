@@ -23,7 +23,7 @@ COPY BlastRadiusReport.json MigrationDelta.json Stage3MigrationReport.json /app/
 # Environment settings
 ENV PYTHONPATH=/app \
     PYTHONUNBUFFERED=1 \
-    ALLOW_LOCAL_REPOS=1
+    ALLOW_LOCAL_REPOS=0
 
 EXPOSE 8000
 

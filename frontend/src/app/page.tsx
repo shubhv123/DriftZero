@@ -19,8 +19,9 @@ import {
   Stage4Report,
   Stage5Bundle,
   StageTiming,
+  ManifestConflictsData,
 } from "../types/migration";
-import { FileCode, Terminal, FileCode2, AlertCircle } from "lucide-react";
+import { FileCode, Terminal, FileCode2, AlertCircle, AlertTriangle } from "lucide-react";
 
 export default function DriftZeroCommandCenter() {
   // Input parameters (Autonomous Discovery Engine handles library & version detection)
@@ -43,6 +44,8 @@ export default function DriftZeroCommandCenter() {
   const [isCompleted, setIsCompleted] = useState<boolean>(false);
   const [isError, setIsError] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [verificationWarning, setVerificationWarning] = useState<string | null>(null);
+  const [manifestConflicts, setManifestConflicts] = useState<ManifestConflictsData | null>(null);
   const [stageTimings, setStageTimings] = useState<Record<number, StageTiming>>(
     {}
   );
@@ -67,9 +70,7 @@ export default function DriftZeroCommandCenter() {
   const [actualCostUsd, setActualCostUsd] = useState<number>(0);
   const [hypotheticalCostUsd, setHypotheticalCostUsd] = useState<number>(0);
   const [savingsPercentage, setSavingsPercentage] = useState<number>(0);
-  const [executionMode, setExecutionMode] = useState<
-    "LIVE_NEBIUS" | "DETERMINISTIC_FALLBACK" | "AWAITING"
-  >("AWAITING");
+  const [executionMode, setExecutionMode] = useState<string>("AWAITING");
   const [superModelLabel, setSuperModelLabel] = useState<string>("Nemotron Super");
   const [ultraModelLabel, setUltraModelLabel] = useState<string>("Nemotron Ultra");
 
@@ -123,6 +124,8 @@ export default function DriftZeroCommandCenter() {
     setIsCompleted(false);
     setIsError(false);
     setErrorMessage(null);
+    setVerificationWarning(null);
+    setManifestConflicts(null);
     setCurrentStage(0);
     setStageTimings({});
     setBlastReport(null);
@@ -152,6 +155,7 @@ export default function DriftZeroCommandCenter() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          "X-API-Key": process.env.NEXT_PUBLIC_DRIFTZERO_API_KEY || "driftzero_secret_key_123",
         },
         body: JSON.stringify({
           repo_url: activeRepo.trim(),
@@ -333,8 +337,14 @@ export default function DriftZeroCommandCenter() {
           }
           setActualCostUsd((c) => c + (tel.actual_cost_usd || 0));
           setHypotheticalCostUsd((c) => c + (tel.hypothetical_ultra_cost_usd || 0));
-          setExecutionMode(tel.execution_mode || "LIVE_NEBIUS");
+          setExecutionMode(tel.execution_mode || "NEBIUS_TOKEN_FACTORY");
         }
+        break;
+      }
+
+      case "manifest_conflicts": {
+        console.log("Manifest conflicts received:", data);
+        setManifestConflicts(data as ManifestConflictsData);
         break;
       }
 
@@ -397,10 +407,23 @@ export default function DriftZeroCommandCenter() {
         break;
       }
 
-      case "pipeline_done":
-        setIsCompleted(true);
+      case "pipeline_done": {
         setIsRunning(false);
+        const finalVer = data.final_verification;
+        if (finalVer && finalVer !== "PASSED") {
+          setIsCompleted(false);
+          setIsError(true);
+          const warnMsg = `Verification status: ${finalVer}. Parity tests did not pass 100%.`;
+          setErrorMessage(warnMsg);
+          setVerificationWarning(warnMsg);
+        } else {
+          setIsCompleted(true);
+          setIsError(false);
+          setErrorMessage(null);
+          setVerificationWarning(null);
+        }
         break;
+      }
 
       case "pipeline_error":
         setIsError(true);
@@ -445,7 +468,7 @@ export default function DriftZeroCommandCenter() {
             : isCompleted
             ? "Migration Verified"
             : isError
-            ? "Pipeline Error"
+            ? (verificationWarning ? "Verification Warning" : "Pipeline Error")
             : "Online"
         }
         isStreaming={isRunning}
@@ -489,16 +512,59 @@ export default function DriftZeroCommandCenter() {
           ultraModelLabel={ultraModelLabel}
         />
 
-        {/* Error Alert Banner if pipeline fails */}
+        {/* Manifest Dependency Conflicts Alert Banner */}
+        {manifestConflicts && manifestConflicts.conflicts && manifestConflicts.conflicts.length > 0 && (
+          <div className="mx-4 mt-2 p-3 rounded-xl bg-amber-950/40 border border-amber-500/50 text-amber-200 text-xs shadow-lg flex flex-col gap-1.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0" />
+                <span className="font-semibold text-amber-300">
+                  Manifest Dependency Conflicts Detected:
+                </span>
+                <span className="text-[11px] text-amber-400/80">
+                  ({manifestConflicts.conflicts.length} conflict{manifestConflicts.conflicts.length > 1 ? "s" : ""})
+                </span>
+              </div>
+              <button
+                onClick={() => setManifestConflicts(null)}
+                className="text-slate-400 hover:text-white text-xs px-2 py-0.5"
+              >
+                Dismiss
+              </button>
+            </div>
+            <div className="pl-6 space-y-1">
+              {manifestConflicts.conflicts.map((conflict, idx) => (
+                <div key={idx} className="font-mono text-[11px] text-amber-200/90 flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0" />
+                  <span>{conflict}</span>
+                </div>
+              ))}
+            </div>
+            {manifestConflicts.companion_packages_added && manifestConflicts.companion_packages_added.length > 0 && (
+              <div className="pl-6 text-[10px] text-slate-400 font-mono">
+                Companion packages auto-bumped / added: {manifestConflicts.companion_packages_added.join(", ")}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Error or Verification Warning Alert Banner if pipeline fails or parity checks do not pass */}
         {isError && errorMessage && (
-          <div className="mx-4 mt-2 p-3 rounded-xl bg-rose-950/40 border border-rose-500/50 text-rose-300 text-xs flex items-center justify-between shadow-lg">
+          <div className={`mx-4 mt-2 p-3 rounded-xl border text-xs flex items-center justify-between shadow-lg ${
+            verificationWarning
+              ? "bg-amber-950/40 border-amber-500/50 text-amber-300"
+              : "bg-rose-950/40 border-rose-500/50 text-rose-300"
+          }`}>
             <div className="flex items-center gap-2">
-              <AlertCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />
-              <span className="font-semibold">Pipeline Failure:</span>
+              <AlertCircle className={`w-4 h-4 flex-shrink-0 ${verificationWarning ? "text-amber-400" : "text-rose-400"}`} />
+              <span className="font-semibold">{verificationWarning ? "Verification Warning:" : "Pipeline Failure:"}</span>
               <span>{errorMessage}</span>
             </div>
             <button
-              onClick={() => setIsError(false)}
+              onClick={() => {
+                setIsError(false);
+                setVerificationWarning(null);
+              }}
               className="text-slate-400 hover:text-white text-xs px-2 py-0.5"
             >
               Dismiss

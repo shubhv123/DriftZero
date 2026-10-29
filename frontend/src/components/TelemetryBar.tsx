@@ -17,7 +17,7 @@ interface TelemetryBarProps {
   actualCostUsd: number;
   hypotheticalCostUsd: number;
   savingsPercentage: number;
-  executionMode: "LIVE_NEBIUS" | "DETERMINISTIC_FALLBACK" | "AWAITING";
+  executionMode: "NEBIUS_TOKEN_FACTORY" | "LIBCST_DETERMINISTIC_CODEMOD" | "LIVE_NEBIUS" | "DETERMINISTIC_FALLBACK" | "AWAITING" | string;
   superModelLabel?: string;
   ultraModelLabel?: string;
 }
@@ -147,21 +147,23 @@ export function TelemetryBar({
               Inference Engine
             </span>
             <span className="text-[10px] text-slate-500 font-mono">
-              Nemotron-3
+              {executionMode === "LIBCST_DETERMINISTIC_CODEMOD" || executionMode === "DETERMINISTIC_FALLBACK"
+                ? "Deterministic"
+                : "Nemotron-3"}
             </span>
           </div>
 
           <div className="flex items-center gap-2">
-            {executionMode === "LIVE_NEBIUS" ? (
+            {executionMode === "NEBIUS_TOKEN_FACTORY" || executionMode === "LIVE_NEBIUS" ? (
               <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs font-semibold shadow-sm shadow-emerald-500/20">
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping inline-block" />
                 <Globe2 className="w-3.5 h-3.5 text-emerald-400" />
-                <span>🌐 LIVE NEBIUS TOKEN FACTORY</span>
+                <span>🌐 NEBIUS TOKEN FACTORY</span>
               </div>
-            ) : executionMode === "DETERMINISTIC_FALLBACK" ? (
-              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-500/15 border border-amber-500/40 text-amber-300 text-xs font-semibold">
+            ) : executionMode === "LIBCST_DETERMINISTIC_CODEMOD" || executionMode === "DETERMINISTIC_FALLBACK" ? (
+              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-500/15 border border-amber-500/40 text-amber-300 text-xs font-semibold shadow-sm shadow-amber-500/20">
                 <Zap className="w-3.5 h-3.5 text-amber-400" />
-                <span>⚡ DETERMINISTIC FALLBACK</span>
+                <span>⚡ LIBCST DETERMINISTIC CODEMOD</span>
               </div>
             ) : (
               <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-blue-500/15 border border-blue-500/40 text-blue-300 text-xs font-semibold">
@@ -173,7 +175,11 @@ export function TelemetryBar({
 
           <div className="text-[10px] text-slate-500 flex items-center justify-between">
             <span>High-Throughput Streaming</span>
-            <span>JSON Mode Active</span>
+            <span>
+              {executionMode === "LIBCST_DETERMINISTIC_CODEMOD"
+                ? "Zero Tokens Used"
+                : "JSON Mode Active"}
+            </span>
           </div>
         </div>
       </div>

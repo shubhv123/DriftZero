@@ -82,7 +82,13 @@ export interface FileTelemetry {
   actual_cost_usd: number;
   hypothetical_ultra_cost_usd: number;
   cost_saved_usd?: number;
-  execution_mode?: "LIVE_NEBIUS" | "DETERMINISTIC_FALLBACK";
+  execution_mode?: "NEBIUS_TOKEN_FACTORY" | "LIBCST_DETERMINISTIC_CODEMOD" | "LIVE_NEBIUS" | "DETERMINISTIC_FALLBACK" | string;
+}
+
+export interface ManifestConflictsData {
+  conflicts: string[];
+  companion_packages_added?: string[];
+  manifests_updated?: string[];
 }
 
 export interface PatchedFileEvent {

@@ -1,13 +1,16 @@
 /** @type {import('next').NextConfig} */
+process.env.BACKEND_URL = process.env.BACKEND_URL || 'http://backend:8000';
+
 const nextConfig = {
   async rewrites() {
     return [
       {
         source: '/api/:path*',
-        destination: 'http://127.0.0.1:8000/api/:path*',
+        destination: process.env.BACKEND_URL + "/api/:path*",
       },
     ];
   },
 };
 
 module.exports = nextConfig;
+

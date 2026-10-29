@@ -3,7 +3,7 @@
   "target_library": "pydantic",
   "old_version": "1.10.12",
   "target_version": "2.9.2",
-  "scan_duration_ms": 7.18,
+  "scan_duration_ms": 7.79,
   "total_files_scanned": 8,
   "affected_files_count": 8,
   "super_routed_count": 0,

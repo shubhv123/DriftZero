@@ -6,7 +6,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
@@ -148,30 +148,93 @@ def _validate_patch(
         if missing_funcs:
             return False, f"Structural validation failed: missing original functions {list(missing_funcs)}"
 
-    # Re-run FileASTVisitor on the result and require zero deprecated symbols
+    # Re-run FileASTVisitor on candidate and require zero deprecated symbols via exact symbol / AST matching
+    clean_target = (target_library or "").lower().replace("-", "_")
     source_lines = candidate.splitlines()
     visitor = FileASTVisitor(source_lines, target_library)
     visitor.visit(cand_tree)
 
-    deprecated_patterns = set()
+    # Collect exact method rules to match against method_call usages
+    deprecated_methods: Set[str] = set()
     for rule in relevant_rules:
-        if rule.symbol:
-            deprecated_patterns.add(rule.symbol.strip().lower())
-        if rule.old_syntax:
-            deprecated_patterns.add(rule.old_syntax.strip().lower())
+        sym = (rule.symbol or "").strip()
+        if sym.startswith("."):
+            deprecated_methods.add(sym.rstrip("()").lstrip(".").lower())
+        elif sym in ("dict", "json", "copy", "parse_obj", "parse_raw", "schema", "schema_json", "construct"):
+            deprecated_methods.add(sym.lower())
+        if rule.old_syntax and "." in rule.old_syntax and "(" in rule.old_syntax:
+            m = rule.old_syntax.split("(")[0].split(".")[-1].strip().lower()
+            if m:
+                deprecated_methods.add(m)
 
-    deprecated_found = []
+    deprecated_found: List[str] = []
+
+    # 1. Exact symbol matching on method calls from FileASTVisitor
     for usage in visitor.usages:
-        sym = usage.symbol_name.strip().lower()
-        for dep in deprecated_patterns:
-            if dep and (dep == sym or dep in sym or sym in dep):
-                deprecated_found.append(f"{usage.symbol_name} (line {usage.line_number})")
-                break
+        if usage.usage_type == "method_call" and usage.symbol_name.startswith("."):
+            m_name = usage.symbol_name.rstrip("()").lstrip(".").lower()
+            if m_name in deprecated_methods:
+                deprecated_found.append(f"Method call `.{m_name}()` (line {usage.line_number})")
 
-    # Also check candidate text for remaining explicit deprecated syntax
-    for rule in relevant_rules:
-        if rule.old_syntax and rule.old_syntax in candidate:
-            deprecated_found.append(f"Deprecated syntax '{rule.old_syntax}' still present")
+    # 2. Exact AST matching for decorators, imports, base classes, Config attrs, and calls
+    for node in ast.walk(cand_tree):
+        # Decorators: exact match against @validator, @root_validator
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            for dec in node.decorator_list:
+                dec_func = dec.func if isinstance(dec, ast.Call) else dec
+                dec_name = ast.unparse(dec_func) if hasattr(ast, "unparse") else ""
+                clean_name = dec_name.strip().lstrip("@")
+                if clean_name in ("validator", "root_validator", f"{clean_target}.validator", f"{clean_target}.root_validator"):
+                    deprecated_found.append(f"Decorator `@{clean_name}` (line {dec.lineno})")
+
+        # Imports: exact match for deprecated names from target library
+        elif isinstance(node, ast.ImportFrom):
+            mod = (node.module or "").lower().replace("-", "_")
+            if mod == clean_target:
+                for alias in node.names:
+                    if alias.name in ("validator", "root_validator", "parse_obj_as", "BaseSettings", "GenericModel"):
+                        deprecated_found.append(f"Import `{alias.name}` from `{node.module}` (line {node.lineno})")
+            elif mod == f"{clean_target}.generics":
+                for alias in node.names:
+                    if alias.name == "GenericModel":
+                        deprecated_found.append(f"Import `GenericModel` from `{node.module}` (line {node.lineno})")
+
+        # ClassDef bases & inner Config classes
+        elif isinstance(node, ast.ClassDef):
+            for base in node.bases:
+                base_name = ast.unparse(base) if hasattr(ast, "unparse") else ""
+                if base_name in ("GenericModel", f"{clean_target}.generics.GenericModel"):
+                    deprecated_found.append(f"Inheritance from `{base_name}` in class `{node.name}` (line {node.lineno})")
+                elif base_name in ("BaseSettings", f"{clean_target}.BaseSettings") and "BaseSettings" in visitor.imported_symbols:
+                    deprecated_found.append(f"Inheritance from `{base_name}` in class `{node.name}` (line {node.lineno})")
+
+            # Check deprecated inner Config attributes
+            if node.name == "Config":
+                for item in node.body:
+                    if isinstance(item, ast.Assign):
+                        for target in item.targets:
+                            if isinstance(target, ast.Name) and target.id in (
+                                "orm_mode",
+                                "allow_population_by_field_name",
+                                "anystr_strip_whitespace",
+                                "allow_mutation",
+                                "schema_extra",
+                            ):
+                                deprecated_found.append(f"Config attribute `{target.id}` in class Config (line {item.lineno})")
+
+        # Special fields: __root__
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "__root__":
+            deprecated_found.append(f"Special field `__root__` in class model (line {node.lineno})")
+
+        # Function / Method calls
+        elif isinstance(node, ast.Call):
+            call_func = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
+            if call_func in ("parse_obj_as", f"{clean_target}.parse_obj_as"):
+                deprecated_found.append(f"Function call `{call_func}()` (line {node.lineno})")
+            elif call_func in ("Field", f"{clean_target}.Field"):
+                for kw in node.keywords:
+                    if kw.arg in ("regex", "min_items", "max_items"):
+                        deprecated_found.append(f"Deprecated Field argument `{kw.arg}` (line {node.lineno})")
 
     if deprecated_found:
         unique_dep = list(dict.fromkeys(deprecated_found))
@@ -206,16 +269,41 @@ def patch_single_file_via_token_factory(
     Zero silent fallbacks.
     """
     start_time = time.perf_counter()
-    original_code = Path(file_report.file_path).read_text(encoding="utf-8")
+    original_code = file_report.source_code or Path(file_report.file_path).read_text(encoding="utf-8")
     is_ultra = file_report.assigned_tier == "NEMOTRON_ULTRA"
 
     model_id = NEMOTRON_ULTRA_MODEL if is_ultra else NEMOTRON_SUPER_MODEL
     system_prompt = ULTRA_DEEP_REFACTOR_SYSTEM_PROMPT if is_ultra else SUPER_FAST_PATCH_SYSTEM_PROMPT
 
     if not NEBIUS_API_KEY:
-        raise RuntimeError(
+        final_error = (
             f"Stage 3 Error: NEBIUS_API_KEY is not configured. Live Nebius Token Factory "
             f"inference is required to patch '{file_report.relative_path}'."
+        )
+        print(f"  ❌ [NEBIUS TOKEN FACTORY] File {file_report.relative_path} FAILED: {final_error}", flush=True)
+        return FilePatchResult(
+            relative_path=file_report.relative_path,
+            original_code=original_code,
+            patched_code="",
+            unified_diff="",
+            assigned_tier=file_report.assigned_tier,
+            model_used=model_id,
+            syntax_valid=False,
+            telemetry=TelemetryEvent(
+                file_path=file_report.relative_path,
+                assigned_tier=file_report.assigned_tier,
+                model_used=model_id,
+                complexity_score=file_report.normalized_score,
+                prompt_tokens=0,
+                completion_tokens=0,
+                latency_ms=0.0,
+                actual_cost_usd=0.0,
+                hypothetical_ultra_cost_usd=0.0,
+                cost_saved_usd=0.0,
+                execution_mode="NEBIUS_TOKEN_FACTORY",
+            ),
+            status="FAILED",
+            error_message=final_error,
         )
 
     # Filter rules to only those relevant to this file to cut prompt tokens
@@ -385,6 +473,7 @@ def patch_single_file_via_token_factory(
 def execute_stage2_and_stage3_pipeline(
     blast_report: BlastRadiusReport,
     output_dir: Path,
+    build_log: Optional[str] = None,
 ) -> Tuple[MigrationDelta, Stage3MigrationReport]:
     """
     Runs Stage 2 (Tavily Live Delta) + Stage 3 (Nebius Token Factory Smart Router).
@@ -393,7 +482,7 @@ def execute_stage2_and_stage3_pipeline(
     3. Processes residual files in parallel using ThreadPoolExecutor.
     4. Writes successfully patched files to `output_dir`. Never writes failed files.
     """
-    migration_delta = build_migration_delta(blast_report)
+    migration_delta = build_migration_delta(blast_report, build_log)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     patches_by_path: Dict[str, FilePatchResult] = {}
@@ -422,7 +511,11 @@ def execute_stage2_and_stage3_pipeline(
                     print(f"  ❌ [ThreadPoolExecutor] Exception on {file_rep.relative_path}: {exc}", flush=True)
                     patch_res = FilePatchResult(
                         relative_path=file_rep.relative_path,
-                        original_code=file_rep.source_code or "",
+                        original_code=file_rep.source_code or (
+                            Path(file_rep.file_path).read_text(encoding="utf-8")
+                            if file_rep.file_path and Path(file_rep.file_path).exists()
+                            else ""
+                        ),
                         patched_code="",
                         unified_diff="",
                         assigned_tier=file_rep.assigned_tier,
@@ -447,6 +540,7 @@ def execute_stage2_and_stage3_pipeline(
                 patches_by_path[patch_res.relative_path] = patch_res
 
     patches: List[FilePatchResult] = []
+    codemod_count = 0
     super_count = 0
     ultra_count = 0
     total_latency = 0.0
@@ -460,7 +554,9 @@ def execute_stage2_and_stage3_pipeline(
             continue
         patches.append(patch_res)
 
-        if patch_res.assigned_tier == "NEMOTRON_SUPER":
+        if patch_res.model_used == "LIBCST_DETERMINISTIC_CODEMOD" or getattr(patch_res.telemetry, "execution_mode", "") == "LIBCST_DETERMINISTIC_CODEMOD":
+            codemod_count += 1
+        elif patch_res.assigned_tier == "NEMOTRON_SUPER":
             super_count += 1
         else:
             ultra_count += 1
@@ -485,6 +581,7 @@ def execute_stage2_and_stage3_pipeline(
 
     stage3_report = Stage3MigrationReport(
         total_files_patched=len([p for p in patches if p.status == "SUCCESS"]),
+        codemod_files_count=codemod_count,
         super_files_count=super_count,
         ultra_files_count=ultra_count,
         total_latency_ms=round(total_latency, 2),

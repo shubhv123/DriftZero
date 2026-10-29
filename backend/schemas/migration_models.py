@@ -112,6 +112,7 @@ class Stage3MigrationReport:
     total_hypothetical_ultra_cost_usd: float
     total_cost_savings_pct: float
     patches: List[FilePatchResult] = field(default_factory=list)
+    codemod_files_count: int = 0
 
     def to_dict(self) -> Dict:
         return asdict(self)

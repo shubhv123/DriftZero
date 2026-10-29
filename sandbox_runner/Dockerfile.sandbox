@@ -8,15 +8,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends git curl && \
     rm -rf /var/lib/apt/lists/* && \
     pip install --no-cache-dir "pytest>=8.0.0"
 
-ARG TARGET_DIR="."
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ARG TARGET_DIR="repo"
 COPY ${TARGET_DIR} /workspace/
 
 # Install workspace dependencies inside container during build so network can be disabled during test execution
 RUN if [ -f /workspace/requirements.txt ]; then pip install --no-cache-dir -r /workspace/requirements.txt; \
     elif [ -f /workspace/pyproject.toml ]; then pip install --no-cache-dir /workspace; fi
 
-COPY sandbox_runner/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN mkdir -p /out
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["test_migration_parity.py", "-v", "--tb=short"]

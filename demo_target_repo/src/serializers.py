@@ -14,3 +14,7 @@ def serialize_for_kafka(order: OrderRequest) -> str:
 
 def clone_order_with_new_id(order: OrderRequest, new_id: str) -> OrderRequest:
     return order.copy(update={"order_id": new_id}, deep=True)
+
+
+def duplicate_dict_payload(raw_meta: dict) -> dict:
+    return raw_meta.copy()

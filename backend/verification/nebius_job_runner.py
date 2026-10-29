@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -163,6 +164,26 @@ def _run_nebius_serverless_job(
         return None
 
 
+def _is_docker_daemon_reachable() -> bool:
+    """
+    Checks if Docker CLI is present and the Docker daemon is reachable via 'docker info'.
+    Falls back only when the daemon is unreachable.
+    """
+    docker_bin = shutil.which("docker")
+    if not docker_bin:
+        return False
+    try:
+        proc = subprocess.run(
+            [docker_bin, "info"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
 def _run_docker_container(
     repo_dir: Path,
     job_id: str,
@@ -170,12 +191,12 @@ def _run_docker_container(
     target_label: str = "PATCHED",
     timeout: int = 45,
     extra_env: Optional[Dict[str, str]] = None,
+    host_out_dir: Optional[Path] = None,
 ) -> SandboxRunAttempt:
     """
     Runs Docker container locally using sandbox_runner/Dockerfile.sandbox.
-    Installs repo requirements inside container during image build.
-    Runs with --network none, CPU limit 2.0, memory limit 2g.
-    Catches TimeoutExpired and returns failed attempt.
+    Builds from a temp context containing the repo and entrypoint.sh.
+    Runs with -v <host_out_dir>:/out and writes golden.json there.
     """
     start_time = time.perf_counter()
     exec_target = "LOCAL_DOCKER_SANDBOX"
@@ -189,59 +210,74 @@ def _run_docker_container(
     if not dockerfile_path.exists():
         dockerfile_path = Path("sandbox_runner/Dockerfile.sandbox").resolve()
 
-    image_tag = f"driftzero-sandbox-{job_id.lower()}"
+    entrypoint_path = project_root / "sandbox_runner" / "entrypoint.sh"
+    if not entrypoint_path.exists():
+        entrypoint_path = Path("sandbox_runner/entrypoint.sh").resolve()
 
-    # 1. Build container image using sandbox_runner/Dockerfile.sandbox
-    # Requirements are installed inside the container at build time
-    build_cmd = [
-        docker_bin, "build",
-        "-f", str(dockerfile_path),
-        "-t", image_tag,
-        "--build-arg", "TARGET_DIR=.",
-        str(repo_dir),
-    ]
-    try:
-        build_proc = subprocess.run(
-            build_cmd,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if build_proc.returncode != 0:
+    image_tag = f"driftzero-sandbox-{job_id.lower()}"
+    out_dir = (host_out_dir or repo_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Build from a temp context containing the repo and entrypoint.sh
+    with tempfile.TemporaryDirectory(prefix="driftzero_docker_ctx_") as temp_ctx_str:
+        temp_ctx = Path(temp_ctx_str)
+        # Copy repo into temp_ctx / "repo"
+        shutil.copytree(repo_dir, temp_ctx / "repo", dirs_exist_ok=True)
+        # Copy entrypoint.sh into temp_ctx
+        shutil.copy2(entrypoint_path, temp_ctx / "entrypoint.sh")
+        # Copy Dockerfile.sandbox into temp_ctx
+        shutil.copy2(dockerfile_path, temp_ctx / "Dockerfile")
+
+        build_cmd = [
+            docker_bin, "build",
+            "-f", str(temp_ctx / "Dockerfile"),
+            "-t", image_tag,
+            "--build-arg", "TARGET_DIR=repo",
+            str(temp_ctx),
+        ]
+        try:
+            build_proc = subprocess.run(
+                build_cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if build_proc.returncode != 0:
+                duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+                return SandboxRunAttempt(
+                    attempt_number=attempt_num,
+                    job_id=job_id,
+                    execution_target=exec_target,
+                    exit_code=build_proc.returncode,
+                    passed_count=0,
+                    failed_count=1,
+                    duration_ms=duration_ms,
+                    stdout_log=build_proc.stdout,
+                    stderr_traceback=f"Container build failed:\n{build_proc.stderr}".strip(),
+                )
+        except subprocess.TimeoutExpired as exc:
             duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+            out = exc.stdout or ""
+            err = exc.stderr or ""
             return SandboxRunAttempt(
                 attempt_number=attempt_num,
                 job_id=job_id,
                 execution_target=exec_target,
-                exit_code=build_proc.returncode,
+                exit_code=124,
                 passed_count=0,
                 failed_count=1,
                 duration_ms=duration_ms,
-                stdout_log=build_proc.stdout,
-                stderr_traceback=f"Container build failed:\n{build_proc.stderr}".strip(),
+                stdout_log=out if isinstance(out, str) else out.decode("utf-8", errors="replace"),
+                stderr_traceback=f"Container image build timed out after 120s.\n{err}".strip(),
             )
-    except subprocess.TimeoutExpired as exc:
-        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
-        out = exc.stdout or ""
-        err = exc.stderr or ""
-        return SandboxRunAttempt(
-            attempt_number=attempt_num,
-            job_id=job_id,
-            execution_target=exec_target,
-            exit_code=124,
-            passed_count=0,
-            failed_count=1,
-            duration_ms=duration_ms,
-            stdout_log=out if isinstance(out, str) else out.decode("utf-8", errors="replace"),
-            stderr_traceback=f"Container image build timed out after 120s.\n{err}".strip(),
-        )
 
-    # 2. Run container: no network after install (--network none), CPU/memory limits
+    # 2. Run with -v <host_out_dir>:/out and write golden.json there
     run_cmd = [
         docker_bin, "run", "--rm",
         "--network", "none",
         "--cpus", "2.0",
         "--memory", "2g",
+        "-v", f"{str(out_dir)}:/out",
     ]
     if extra_env:
         for k, v in extra_env.items():
@@ -267,6 +303,10 @@ def _run_docker_container(
             traceback_excerpt = run_proc.stdout.split("ERRORS", 1)[1]
         elif run_proc.returncode != 0 and run_proc.stdout:
             traceback_excerpt = run_proc.stdout
+
+        # Ensure golden.json written to /out is available in repo_dir
+        if (out_dir / "golden.json").exists() and not (repo_dir / "golden.json").exists():
+            shutil.copy2(out_dir / "golden.json", repo_dir / "golden.json")
 
         return SandboxRunAttempt(
             attempt_number=attempt_num,
@@ -309,64 +349,227 @@ def _run_local_process_sandbox(
 ) -> SandboxRunAttempt:
     """
     Fallback runner when local Docker daemon is not active.
-    Applies timeout and catches TimeoutExpired.
-    Labeled LOCAL_SANDBOX_RUNNER (NOT NEBIUS!).
+    Creates an isolated venv per run with `python -m venv`.
+    Pip-installs baseline pins for BASELINE and the patched manifest for PATCHED.
+    Runs pytest with that venv's python executable.
+    If environment creation, dependency installation, or execution fails,
+    returns a failed attempt with a clear error.
     """
     start_time = time.perf_counter()
     exec_target = "LOCAL_SANDBOX_RUNNER"
 
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(repo_dir)
-    if extra_env:
-        env.update(extra_env)
+    # 1. Create a dedicated venv per run with python -m venv
+    with tempfile.TemporaryDirectory(prefix=f"driftzero_venv_{target_label.lower()}_") as venv_str:
+        venv_path = Path(venv_str)
 
-    cmd = [sys.executable, "-m", "pytest", "test_migration_parity.py", "-v", "--tb=short"]
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(repo_dir),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
-        passed, failed = _parse_pytest_counts(proc.stdout)
+        venv_cmd = [sys.executable, "-m", "venv", str(venv_path)]
+        try:
+            venv_proc = subprocess.run(
+                venv_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if venv_proc.returncode != 0:
+                duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+                return SandboxRunAttempt(
+                    attempt_number=attempt_num,
+                    job_id=job_id,
+                    execution_target=exec_target,
+                    exit_code=venv_proc.returncode,
+                    passed_count=0,
+                    failed_count=1,
+                    duration_ms=duration_ms,
+                    stdout_log=venv_proc.stdout,
+                    stderr_traceback=f"Failed to create virtual environment with 'python -m venv':\n{venv_proc.stderr}".strip(),
+                )
+        except Exception as exc:
+            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+            return SandboxRunAttempt(
+                attempt_number=attempt_num,
+                job_id=job_id,
+                execution_target=exec_target,
+                exit_code=1,
+                passed_count=0,
+                failed_count=1,
+                duration_ms=duration_ms,
+                stdout_log="",
+                stderr_traceback=f"Exception creating virtual environment: {exc}",
+            )
 
-        traceback_excerpt = proc.stderr
-        if proc.returncode != 0 and "FAILURES" in proc.stdout:
-            traceback_excerpt = proc.stdout.split("FAILURES", 1)[1]
-        elif proc.returncode != 0 and "ERRORS" in proc.stdout:
-            traceback_excerpt = proc.stdout.split("ERRORS", 1)[1]
-        elif proc.returncode != 0 and proc.stdout:
-            traceback_excerpt = proc.stdout
+        venv_python = venv_path / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        venv_pip = venv_path / ("Scripts/pip.exe" if os.name == "nt" else "bin/pip")
 
-        return SandboxRunAttempt(
-            attempt_number=attempt_num,
-            job_id=job_id,
-            execution_target=exec_target,  # Only labeled NEBIUS when a job was actually submitted!
-            exit_code=proc.returncode,
-            passed_count=passed,
-            failed_count=failed,
-            duration_ms=duration_ms,
-            stdout_log=f"[{target_label} Process Sandbox - LOCAL RUNNER]\n{proc.stdout}",
-            stderr_traceback=traceback_excerpt.strip(),
-        )
-    except subprocess.TimeoutExpired as exc:
-        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
-        out = exc.stdout or ""
-        err = exc.stderr or ""
-        return SandboxRunAttempt(
-            attempt_number=attempt_num,
-            job_id=job_id,
-            execution_target=exec_target,
-            exit_code=124,
-            passed_count=0,
-            failed_count=1,
-            duration_ms=duration_ms,
-            stdout_log=out if isinstance(out, str) else out.decode("utf-8", errors="replace"),
-            stderr_traceback=f"Execution timed out after {timeout} seconds: Container exceeded execution deadline.\n{err}".strip(),
-        )
+        if not venv_python.exists():
+            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+            return SandboxRunAttempt(
+                attempt_number=attempt_num,
+                job_id=job_id,
+                execution_target=exec_target,
+                exit_code=1,
+                passed_count=0,
+                failed_count=1,
+                duration_ms=duration_ms,
+                stdout_log="",
+                stderr_traceback=f"Venv Python executable not found at {venv_python}",
+            )
+
+        # 2. Install pytest in venv
+        try:
+            pytest_inst = subprocess.run(
+                [str(venv_pip), "install", "--no-cache-dir", "pytest>=8.0.0"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if pytest_inst.returncode != 0:
+                duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+                return SandboxRunAttempt(
+                    attempt_number=attempt_num,
+                    job_id=job_id,
+                    execution_target=exec_target,
+                    exit_code=pytest_inst.returncode,
+                    passed_count=0,
+                    failed_count=1,
+                    duration_ms=duration_ms,
+                    stdout_log=pytest_inst.stdout,
+                    stderr_traceback=f"Failed to install pytest in venv:\n{pytest_inst.stderr}".strip(),
+                )
+        except Exception as exc:
+            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+            return SandboxRunAttempt(
+                attempt_number=attempt_num,
+                job_id=job_id,
+                execution_target=exec_target,
+                exit_code=1,
+                passed_count=0,
+                failed_count=1,
+                duration_ms=duration_ms,
+                stdout_log="",
+                stderr_traceback=f"Exception installing pytest into venv: {exc}",
+            )
+
+        # 3. Pip-install baseline pins for BASELINE and patched manifest for PATCHED
+        req_file = repo_dir / "requirements.txt"
+        pyproject_file = repo_dir / "pyproject.toml"
+
+        install_cmd = None
+        if req_file.exists():
+            install_cmd = [str(venv_pip), "install", "--no-cache-dir", "-r", str(req_file)]
+        elif pyproject_file.exists():
+            install_cmd = [str(venv_pip), "install", "--no-cache-dir", str(repo_dir)]
+
+        if install_cmd:
+            try:
+                deps_inst = subprocess.run(
+                    install_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if deps_inst.returncode != 0:
+                    duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+                    manifest_name = "requirements.txt" if req_file.exists() else "pyproject.toml"
+                    return SandboxRunAttempt(
+                        attempt_number=attempt_num,
+                        job_id=job_id,
+                        execution_target=exec_target,
+                        exit_code=deps_inst.returncode,
+                        passed_count=0,
+                        failed_count=1,
+                        duration_ms=duration_ms,
+                        stdout_log=deps_inst.stdout,
+                        stderr_traceback=(
+                            f"Failed to pip-install {target_label} dependencies from {manifest_name} into venv:\n"
+                            f"{deps_inst.stderr}"
+                        ).strip(),
+                    )
+            except Exception as exc:
+                duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+                return SandboxRunAttempt(
+                    attempt_number=attempt_num,
+                    job_id=job_id,
+                    execution_target=exec_target,
+                    exit_code=1,
+                    passed_count=0,
+                    failed_count=1,
+                    duration_ms=duration_ms,
+                    stdout_log="",
+                    stderr_traceback=f"Exception installing {target_label} dependencies into venv: {exc}",
+                )
+
+        # 4. Run pytest with that venv's python
+        env = os.environ.copy()
+        repo_str = str(repo_dir)
+        src_str = str(repo_dir / "src")
+        env["PYTHONPATH"] = f"{repo_str}:{src_str}:{env.get('PYTHONPATH', '')}"
+        env["VIRTUAL_ENV"] = str(venv_path)
+        if "PATH" in env:
+            bin_dir = str(venv_path / ("Scripts" if os.name == "nt" else "bin"))
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+        if extra_env:
+            env.update(extra_env)
+
+        cmd = [str(venv_python), "-m", "pytest", "test_migration_parity.py", "-v", "--tb=short"]
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(repo_dir),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+            passed, failed = _parse_pytest_counts(proc.stdout)
+
+            traceback_excerpt = proc.stderr
+            if proc.returncode != 0 and "FAILURES" in proc.stdout:
+                traceback_excerpt = proc.stdout.split("FAILURES", 1)[1]
+            elif proc.returncode != 0 and "ERRORS" in proc.stdout:
+                traceback_excerpt = proc.stdout.split("ERRORS", 1)[1]
+            elif proc.returncode != 0 and proc.stdout:
+                traceback_excerpt = proc.stdout
+
+            return SandboxRunAttempt(
+                attempt_number=attempt_num,
+                job_id=job_id,
+                execution_target=exec_target,
+                exit_code=proc.returncode,
+                passed_count=passed,
+                failed_count=failed,
+                duration_ms=duration_ms,
+                stdout_log=f"[{target_label} Process Sandbox - LOCAL RUNNER (venv: {venv_path.name})]\n{proc.stdout}",
+                stderr_traceback=traceback_excerpt.strip(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+            out = exc.stdout or ""
+            err = exc.stderr or ""
+            return SandboxRunAttempt(
+                attempt_number=attempt_num,
+                job_id=job_id,
+                execution_target=exec_target,
+                exit_code=124,
+                passed_count=0,
+                failed_count=1,
+                duration_ms=duration_ms,
+                stdout_log=out if isinstance(out, str) else out.decode("utf-8", errors="replace"),
+                stderr_traceback=f"Execution timed out after {timeout} seconds: Process exceeded execution deadline.\n{err}".strip(),
+            )
+        except Exception as exc:
+            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+            return SandboxRunAttempt(
+                attempt_number=attempt_num,
+                job_id=job_id,
+                execution_target=exec_target,
+                exit_code=1,
+                passed_count=0,
+                failed_count=1,
+                duration_ms=duration_ms,
+                stdout_log="",
+                stderr_traceback=f"Local sandbox execution failed with error: {exc}",
+            )
 
 
 def run_single_sandbox_job(
@@ -379,8 +582,8 @@ def run_single_sandbox_job(
     """
     Executes a single sandbox run:
     1. If NEBIUS_SERVERLESS_JOB_ENDPOINT is set, submits to Nebius Serverless Jobs API.
-    2. Otherwise, executes a local container via Docker using sandbox_runner/Dockerfile.sandbox.
-    3. Falls back gracefully to local isolated process if Docker is not available.
+    2. Otherwise, executes a local container via Docker if daemon is reachable (checked via 'docker info').
+    3. Falls back gracefully to isolated local venv process when Docker daemon is unreachable.
     4. Only labels execution_target as NEBIUS when a job was actually submitted to Nebius.
     5. Catches TimeoutExpired and returns a failed attempt.
     """
@@ -395,8 +598,8 @@ def run_single_sandbox_job(
         if nebius_res is not None:
             return nebius_res
 
-    # 2. Local Docker container using sandbox_runner/Dockerfile.sandbox
-    if shutil.which("docker"):
+    # 2. Local Docker container: check docker info (not which) and fall back only when daemon is unreachable
+    if _is_docker_daemon_reachable():
         try:
             return _run_docker_container(
                 repo_dir, job_id, attempt_num, target_label, timeout, extra_env
@@ -404,7 +607,7 @@ def run_single_sandbox_job(
         except Exception as exc:
             print(f"  ⚠️ [Docker Container Fallback] Docker execution notice: {exc}", flush=True)
 
-    # 3. Graceful local process fallback
+    # 3. Graceful local process fallback with isolated per-run venv
     return _run_local_process_sandbox(
         repo_dir, job_id, attempt_num, target_label, timeout, extra_env
     )

@@ -143,6 +143,7 @@ class FileASTVisitor(ast.NodeVisitor):
         self.imported_symbols: Set[str] = set()
         self.usages: List[SymbolUsage] = []
         self.touches_target_lib = False
+        self.model_call_lines: Set[int] = set()
 
         # Scoped variable type tracking: stack of variable name -> type name mappings
         self.scope_stack: List[Dict[str, str]] = [{}]
@@ -419,6 +420,10 @@ class FileASTVisitor(ast.NodeVisitor):
                     is_chained_instantiation = True
                     var_type = inst_func
 
+            is_model_receiver = bool(var_type or is_self_in_lib_class or is_class_call or is_chained_instantiation)
+            if is_model_receiver:
+                self.model_call_lines.add(node.lineno)
+
             if (
                 is_caller_imported
                 or var_type is not None
@@ -435,13 +440,15 @@ class FileASTVisitor(ast.NodeVisitor):
                         usage_type="method_call",
                         line_number=node.lineno,
                         code_snippet=self._get_line_snippet(node.lineno),
-                        complexity_weight=2 if (var_type or is_self_in_lib_class or is_class_call) else 1,
+                        complexity_weight=2 if is_model_receiver else 1,
                         deprecation_hint=f"Method call `.{method_name}()` on target library instance/symbol `{source_desc}`",
                     )
                 )
         # 2. Direct function call: func()
         elif isinstance(node.func, ast.Name):
             func_name = node.func.id
+            if func_name in self.library_classes:
+                self.model_call_lines.add(node.lineno)
             if func_name in self.imported_symbols or func_name in self.library_classes:
                 self.touches_target_lib = True
                 self.usages.append(
@@ -456,6 +463,9 @@ class FileASTVisitor(ast.NodeVisitor):
                 )
 
         self.generic_visit(node)
+
+    def get_model_method_call_lines(self) -> Set[int]:
+        return set(self.model_call_lines)
 
 
 def scan_repository(

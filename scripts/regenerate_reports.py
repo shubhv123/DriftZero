@@ -1,6 +1,11 @@
-import os
 import json
+import os
+import sys
 from pathlib import Path
+
+_project_root = str(Path(__file__).resolve().parent.parent)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 from backend.config import PROJECT_ROOT
 from backend.core.ast_scanner import scan_repository
@@ -47,6 +52,7 @@ def main():
         
     s3_report = Stage3MigrationReport(
         total_files_patched=len(patches),
+        codemod_files_count=telemetry.codemod_calls,
         super_files_count=telemetry.super_calls,
         ultra_files_count=telemetry.ultra_calls,
         total_latency_ms=round(telemetry.total_latency_ms, 2),

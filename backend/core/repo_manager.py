@@ -1,13 +1,14 @@
-# Clones target GitHub repo, parses requirements.txt/pyproject.toml, manages manifests & workspaces
+import ast
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 GITHUB_URL_REGEX = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+(\.git)?$")
 
@@ -55,11 +56,17 @@ class ManifestUpdateResult:
         conflicts: List[str],
         companion_packages_added: List[str],
         manifests_updated: List[str],
+        auto_bumped_packages: Optional[List[str]] = None,
+        status: str = "SUCCESS",
+        needs_manual: bool = False,
     ):
         self.updated = updated
         self.conflicts = conflicts
         self.companion_packages_added = companion_packages_added
         self.manifests_updated = manifests_updated
+        self.auto_bumped_packages = auto_bumped_packages or []
+        self.status = status
+        self.needs_manual = needs_manual
 
     def __bool__(self) -> bool:
         return self.updated
@@ -69,7 +76,13 @@ class ManifestUpdateResult:
         yield self.conflicts
 
     def __repr__(self) -> str:
-        return f"<ManifestUpdateResult updated={self.updated} conflicts={len(self.conflicts)} companions={len(self.companion_packages_added)}>"
+        return (
+            f"<ManifestUpdateResult updated={self.updated} "
+            f"conflicts={len(self.conflicts)} "
+            f"companions={len(self.companion_packages_added)} "
+            f"auto_bumped={len(self.auto_bumped_packages)} "
+            f"status={self.status}>"
+        )
 
 
 def is_git_url(repo_str: str) -> bool:
@@ -502,16 +515,69 @@ def _add_companion_packages(
     return added
 
 
+def is_openai_v1_migrated(repo_path: Path) -> bool:
+    """
+    Detects if the repository code has been migrated to the OpenAI v1 client.
+    Checks for v1 client patterns like `OpenAI()`, `from openai import OpenAI`,
+    `AsyncOpenAI`, `AzureOpenAI`, `client.chat.completions.create`, etc.
+    """
+    v1_import_names = {"OpenAI", "AsyncOpenAI", "AzureOpenAI"}
+    v1_regex = re.compile(
+        r"(?:from\s+openai\s+import\s+.*?\b(OpenAI|AsyncOpenAI|AzureOpenAI)\b)|"
+        r"(?:\bopenai\.(?:OpenAI|AsyncOpenAI|AzureOpenAI)\b)|"
+        r"(?:\b(?:OpenAI|AsyncOpenAI|AzureOpenAI)\s*\()|"
+        r"(?:\.chat\.completions\.create\s*\()|"
+        r"(?:\.embeddings\.create\s*\()",
+        re.DOTALL,
+    )
+
+    py_files = [
+        f for f in repo_path.rglob("*.py")
+        if not any(p in f.parts for p in (".venv", "venv", "env", "node_modules", ".git", "__pycache__"))
+    ]
+
+    for py_file in py_files:
+        try:
+            content = py_file.read_text(encoding="utf-8", errors="ignore")
+            if not content.strip():
+                continue
+            # Regex fast check
+            if v1_regex.search(content):
+                return True
+
+            # AST parse check for deeper semantic confirmation
+            try:
+                tree = ast.parse(content)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.ImportFrom) and node.module == "openai":
+                        if any(alias.name in v1_import_names for alias in node.names):
+                            return True
+                    elif isinstance(node, ast.Call):
+                        if isinstance(node.func, ast.Name) and node.func.id in v1_import_names:
+                            return True
+                        elif isinstance(node.func, ast.Attribute) and node.func.attr in v1_import_names:
+                            return True
+            except Exception:
+                pass
+        except Exception:
+            continue
+
+    return False
+
+
 def _bump_pyproject_toml(
     repo_path: Path,
     target_library: str,
     target_version: str,
+    packages_to_bump: Optional[Dict[str, Tuple[str, Tuple[int, ...], str]]] = None,
+    auto_bumped_packages: Optional[List[str]] = None,
 ) -> List[str]:
     """
-    Bumps the target library version in all pyproject.toml files (Poetry and PEP 621).
+    Bumps the target library version and ecosystem packages in all pyproject.toml files (Poetry and PEP 621).
     """
     updated_files: List[str] = []
     lib_name = target_library.strip().lower().replace("_", "-")
+    packages_to_bump = packages_to_bump or {}
 
     pyprojects = [
         f for f in repo_path.rglob("pyproject.toml")
@@ -523,20 +589,69 @@ def _bump_pyproject_toml(
             content = pyproject.read_text(encoding="utf-8", errors="ignore")
             original_content = content
 
-            # 1. Poetry simple: pydantic = "^1.10" or pydantic = ">=1.10"
+            # 1. Bump target library
+            # Poetry simple: pydantic = "^1.10" or pydantic = ">=1.10"
             pat_poetry = rf'(["\']?{re.escape(lib_name)}["\']?\s*=\s*)(["\'])([^"\']+)(["\'])'
             if re.search(pat_poetry, content, re.IGNORECASE):
                 content = re.sub(pat_poetry, rf'\g<1>"^{target_version}"', content, flags=re.IGNORECASE)
 
-            # 2. Poetry inline table: pydantic = { version = "^1.10", ... }
+            # Poetry inline table: pydantic = { version = "^1.10", ... }
             pat_table = rf'({re.escape(lib_name)}\s*=\s*\{{[^}}]*version\s*=\s*)(["\'])([^"\']+)(["\'])'
             if re.search(pat_table, content, re.IGNORECASE):
                 content = re.sub(pat_table, rf'\g<1>"^{target_version}"', content, flags=re.IGNORECASE)
 
-            # 3. PEP 621 array: "pydantic>=1.10.0,<2.0.0" or 'pydantic==1.10'
+            # PEP 621 array: "pydantic>=1.10.0,<2.0.0" or 'pydantic==1.10'
             pat_pep621 = rf'["\']{re.escape(lib_name)}\s*([=><~^!]+)\s*[^"\'\s]+(?:,\s*[=><~^!]+[^"\'\s]+)?["\']'
             if re.search(pat_pep621, content, re.IGNORECASE):
                 content = re.sub(pat_pep621, f'"{target_library}>={target_version}"', content, flags=re.IGNORECASE)
+
+            # 2. Bump packages_to_bump
+            for pkg_key, (display_name, min_ver_tuple, min_ver_str) in packages_to_bump.items():
+                # Poetry simple
+                pkg_pat_poetry = rf'(["\']?{re.escape(pkg_key)}["\']?\s*=\s*)(["\'])([^"\']+)(["\'])'
+
+                def _sub_poetry(match):
+                    orig_ver = match.group(3).lstrip("^~=>=<")
+                    curr = _parse_version_tuple(orig_ver) if orig_ver else (0,)
+                    if curr < min_ver_tuple or "<" in match.group(3) or orig_ver in ("*", ""):
+                        bump_spec = f"{display_name}>={min_ver_str}"
+                        if auto_bumped_packages is not None and bump_spec not in auto_bumped_packages:
+                            auto_bumped_packages.append(bump_spec)
+                        return rf'{match.group(1)}"^{min_ver_str}"'
+                    return match.group(0)
+
+                content = re.sub(pkg_pat_poetry, _sub_poetry, content, flags=re.IGNORECASE)
+
+                # Poetry table
+                pkg_pat_table = rf'({re.escape(pkg_key)}\s*=\s*\{{[^}}]*version\s*=\s*)(["\'])([^"\']+)(["\'])'
+
+                def _sub_table(match):
+                    orig_ver = match.group(3).lstrip("^~=>=<")
+                    curr = _parse_version_tuple(orig_ver) if orig_ver else (0,)
+                    if curr < min_ver_tuple or "<" in match.group(3) or orig_ver in ("*", ""):
+                        bump_spec = f"{display_name}>={min_ver_str}"
+                        if auto_bumped_packages is not None and bump_spec not in auto_bumped_packages:
+                            auto_bumped_packages.append(bump_spec)
+                        return rf'{match.group(1)}"^{min_ver_str}"'
+                    return match.group(0)
+
+                content = re.sub(pkg_pat_table, _sub_table, content, flags=re.IGNORECASE)
+
+                # PEP 621 array
+                pkg_pat_pep621 = rf'["\']{re.escape(pkg_key)}(\[[^\]]*\])?\s*([=><~^!]+)?\s*([^"\'\s,]*)(?:,\s*[=><~^!]+[^"\'\s]+)?["\']'
+
+                def _sub_pep621(match):
+                    extras = match.group(1) or ""
+                    orig_ver = match.group(3) or ""
+                    curr = _parse_version_tuple(orig_ver) if orig_ver else (0,)
+                    if curr < min_ver_tuple or "<" in match.group(0) or not orig_ver:
+                        bump_spec = f"{display_name}>={min_ver_str}"
+                        if auto_bumped_packages is not None and bump_spec not in auto_bumped_packages:
+                            auto_bumped_packages.append(bump_spec)
+                        return f'"{display_name}{extras}>={min_ver_str}"'
+                    return match.group(0)
+
+                content = re.sub(pkg_pat_pep621, _sub_pep621, content, flags=re.IGNORECASE)
 
             if content != original_content:
                 pyproject.write_text(content, encoding="utf-8")
@@ -554,14 +669,33 @@ def update_manifest_version(
 ) -> ManifestUpdateResult:
     """
     Updates the version string in requirements.txt and pyproject.toml to target_version.
+    Auto-bumps every package found in ECOSYSTEM_CONFLICTS to its recommended minimum,
+    and openai if the codebase was migrated to the v1 client.
     Adds required companion packages (e.g. pydantic-settings for Pydantic v2).
-    Reports all other pinned packages that conflict with the upgrade.
+    Runs `pip install --dry-run -r` and reports failure as NEEDS_MANUAL.
     """
     lib_name = target_library.strip().lower().replace("_", "-")
+    target_major = target_version.lstrip("v").split(".")[0]
     manifests_updated: List[str] = []
+    auto_bumped_packages: List[str] = []
 
-    # 1. Inspect conflicts before bumping
-    conflicts = check_manifest_conflicts(repo_path, target_library, target_version)
+    # 1. Determine packages to auto-bump
+    packages_to_bump: Dict[str, Tuple[str, Tuple[int, ...], str]] = {}
+
+    # Packages from ECOSYSTEM_CONFLICTS
+    rules = ECOSYSTEM_CONFLICTS.get(lib_name, {}).get(target_major, [])
+    if not rules and len(ECOSYSTEM_CONFLICTS.get(lib_name, {})) == 1:
+        rules = next(iter(ECOSYSTEM_CONFLICTS[lib_name].values()))
+
+    for conflict_pkg, min_ver, reason in rules:
+        if min_ver is not None:
+            min_ver_str = ".".join(str(n) for n in min_ver)
+            conflict_key = conflict_pkg.strip().lower().replace("_", "-")
+            packages_to_bump[conflict_key] = (conflict_pkg, min_ver, min_ver_str)
+
+    # OpenAI v1 client migration auto-bump
+    if is_openai_v1_migrated(repo_path) and lib_name != "openai":
+        packages_to_bump["openai"] = ("openai", (1, 0, 0), "1.0.0")
 
     # 2. Update requirements*.txt recursively
     req_candidates = [
@@ -573,33 +707,122 @@ def update_manifest_version(
             try:
                 lines = req_file.read_text(encoding="utf-8", errors="ignore").splitlines()
                 new_lines = []
-                matched = False
+                matched_target = False
+                file_modified = False
+
                 for line in lines:
-                    cleaned = line.strip().split("#")[0].strip()
-                    pattern = rf"^{re.escape(lib_name)}\s*([=><~^!]+)\s*([\w\.\-]+)"
-                    if re.search(pattern, cleaned, re.IGNORECASE):
-                        new_lines.append(f"{target_library}=={target_version}")
-                        matched = True
-                        if req_file.name not in manifests_updated:
-                            manifests_updated.append(req_file.name)
-                    else:
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
                         new_lines.append(line)
-                if not matched and req_file.name == "requirements.txt":
+                        continue
+
+                    cleaned = stripped.split("#")[0].strip()
+                    comment = ("  #" + stripped.split("#", 1)[1]) if "#" in stripped else ""
+
+                    # Match target library
+                    target_pat = rf"^{re.escape(lib_name)}(\[[^\]]*\])?\s*([=><~^!].*)?$"
+                    target_m = re.match(target_pat, cleaned, re.IGNORECASE)
+                    if target_m:
+                        extras = target_m.group(1) or ""
+                        new_line = f"{target_library}{extras}=={target_version}{comment}"
+                        new_lines.append(new_line)
+                        matched_target = True
+                        if new_line != line:
+                            file_modified = True
+                        continue
+
+                    # Match packages to auto-bump
+                    bump_m = re.match(r"^([\w\.\-]+)(\[[^\]]*\])?\s*([=><~^!]+)?\s*([\w\.\-]*)", cleaned)
+                    if bump_m:
+                        pkg_key = bump_m.group(1).lower().replace("_", "-")
+                        if pkg_key in packages_to_bump:
+                            display_name, min_ver_tuple, min_ver_str = packages_to_bump[pkg_key]
+                            extras = bump_m.group(2) or ""
+                            op = bump_m.group(3) or ""
+                            ver_str = bump_m.group(4) or ""
+                            curr_ver = _parse_version_tuple(ver_str) if ver_str else (0,)
+
+                            needs_bump = (
+                                not ver_str
+                                or "<" in cleaned
+                                or curr_ver < min_ver_tuple
+                                or (op == "==" and curr_ver <= min_ver_tuple)
+                            )
+                            if needs_bump:
+                                bump_spec = f"{display_name}{extras}>={min_ver_str}"
+                                new_line = f"{bump_spec}{comment}"
+                                new_lines.append(new_line)
+                                if bump_spec not in auto_bumped_packages:
+                                    auto_bumped_packages.append(bump_spec)
+                                file_modified = True
+                                continue
+
+                    new_lines.append(line)
+
+                if not matched_target and req_file.name == "requirements.txt":
                     new_lines.append(f"{target_library}=={target_version}")
+                    file_modified = True
+
+                if file_modified:
+                    req_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
                     if req_file.name not in manifests_updated:
                         manifests_updated.append(req_file.name)
-                req_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-            except Exception:
-                continue
+            except Exception as exc:
+                print(f"[Repo Manager] Could not update {req_file.name}: {exc}")
 
     # 3. Bump pyproject.toml
-    bumped_pyprojects = _bump_pyproject_toml(repo_path, target_library, target_version)
+    bumped_pyprojects = _bump_pyproject_toml(
+        repo_path,
+        target_library,
+        target_version,
+        packages_to_bump=packages_to_bump,
+        auto_bumped_packages=auto_bumped_packages,
+    )
     for p_name in bumped_pyprojects:
         if p_name not in manifests_updated:
             manifests_updated.append(p_name)
 
     # 4. Add companion packages (e.g., pydantic-settings)
     companions_added = _add_companion_packages(repo_path, target_library, target_version)
+
+    # 5. Check remaining manifest conflicts (e.g. unresolvable packages with min_ver=None)
+    conflicts = check_manifest_conflicts(repo_path, target_library, target_version)
+
+    # 6. Run pip install --dry-run -r on updated requirements files and report failure as NEEDS_MANUAL
+    status = "SUCCESS"
+    needs_manual = False
+
+    for req_file in req_candidates:
+        if not req_file.is_file():
+            continue
+        try:
+            cmd = [sys.executable, "-m", "pip", "install", "--dry-run", "-r", str(req_file.resolve())]
+            proc = subprocess.run(
+                cmd,
+                cwd=str(req_file.parent.resolve()),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if proc.returncode != 0:
+                err_output = (proc.stderr or proc.stdout).strip()
+                status = "NEEDS_MANUAL"
+                needs_manual = True
+                conflicts.append(
+                    f"NEEDS_MANUAL: pip install --dry-run -r {req_file.name} failed (exit code {proc.returncode}):\n{err_output}"
+                )
+        except subprocess.TimeoutExpired:
+            status = "NEEDS_MANUAL"
+            needs_manual = True
+            conflicts.append(
+                f"NEEDS_MANUAL: pip install --dry-run -r {req_file.name} timed out after 30s."
+            )
+        except Exception as exc:
+            status = "NEEDS_MANUAL"
+            needs_manual = True
+            conflicts.append(
+                f"NEEDS_MANUAL: pip install --dry-run -r {req_file.name} error: {exc}"
+            )
 
     updated = len(manifests_updated) > 0 or len(companions_added) > 0
 
@@ -608,4 +831,7 @@ def update_manifest_version(
         conflicts=conflicts,
         companion_packages_added=companions_added,
         manifests_updated=manifests_updated,
+        auto_bumped_packages=auto_bumped_packages,
+        status=status,
+        needs_manual=needs_manual,
     )

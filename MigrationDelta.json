@@ -10,48 +10,83 @@
   "citations": [
     "https://pypi.org/project/pydantic/1.10.12",
     "https://pydantic.dev/docs/ai/project/changelog",
-    "https://pydantic.dev/docs/ai/overview/migration",
+    "https://tomodahinata.com/en/blog/pydantic-v1-to-v2-migration-complete-guide",
     "https://github.com/pydantic/pydantic/issues/11119",
     "https://github.com/pydantic/pydantic/releases",
-    "https://github.com/pydantic/pydantic/discussions/6748",
+    "https://github.com/python-poetry/poetry/issues/9774",
     "https://pydantic.dev/docs/validation/latest/get-started/changelog",
-    "https://pydantic.dev/articles/pydantic-v2-9-release",
-    "https://github.com/pydantic/pydantic/issues"
+    "https://github.com/pydantic/pydantic/issues",
+    "https://pydantic-xml.readthedocs.io/en/stable/pages/changelog.html"
   ],
   "rules": [
     {
-      "symbol": ".dict()",
-      "old_syntax": "model.dict()",
-      "new_syntax": "model.model_dump()",
+      "symbol": ".as_openai_messages()",
+      "old_syntax": "# Legacy usage of .as_openai_messages()",
+      "new_syntax": "# Modern replacement for .as_openai_messages() in pydantic 2.9.2",
       "required_imports": [],
-      "breaking_gotcha": "Returns a dict; excludes unset fields by default unless exclude_unset=True passed.",
-      "source_url": "https://pydantic.dev/docs/ai/overview/migration"
+      "breaking_gotcha": "Symbol '.as_openai_messages()' updated in pydantic 2.9.2. Check import path and argument signature.",
+      "source_url": "https://pypi.org/project/pydantic/1.10.12"
     },
     {
-      "symbol": ".json()",
-      "old_syntax": "model.json()",
-      "new_syntax": "model.model_dump_json()",
+      "symbol": ".construct()",
+      "old_syntax": "# Legacy usage of .construct()",
+      "new_syntax": "# Modern replacement for .construct() in pydantic 2.9.2",
       "required_imports": [],
-      "breaking_gotcha": "By default includes all fields; to match v1 behavior of excluding unset, use exclude_unset=True.",
-      "source_url": "https://pydantic.dev/docs/ai/overview/migration"
+      "breaking_gotcha": "Symbol '.construct()' updated in pydantic 2.9.2. Check import path and argument signature.",
+      "source_url": "https://pypi.org/project/pydantic/1.10.12"
     },
     {
       "symbol": ".copy()",
-      "old_syntax": "model.copy(deep=True)",
-      "new_syntax": "model.model_copy(deep=True)",
+      "old_syntax": "# Legacy usage of .copy()",
+      "new_syntax": "# Modern replacement for .copy() in pydantic 2.9.2",
       "required_imports": [],
-      "breaking_gotcha": "Copy method renamed; deep copy still works via deep=True.",
-      "source_url": "https://pydantic.dev/docs/ai/overview/migration"
+      "breaking_gotcha": "Symbol '.copy()' updated in pydantic 2.9.2. Check import path and argument signature.",
+      "source_url": "https://pypi.org/project/pydantic/1.10.12"
+    },
+    {
+      "symbol": ".dict()",
+      "old_syntax": "# Legacy usage of .dict()",
+      "new_syntax": "# Modern replacement for .dict() in pydantic 2.9.2",
+      "required_imports": [],
+      "breaking_gotcha": "Symbol '.dict()' updated in pydantic 2.9.2. Check import path and argument signature.",
+      "source_url": "https://pypi.org/project/pydantic/1.10.12"
+    },
+    {
+      "symbol": ".json()",
+      "old_syntax": "# Legacy usage of .json()",
+      "new_syntax": "# Modern replacement for .json() in pydantic 2.9.2",
+      "required_imports": [],
+      "breaking_gotcha": "Symbol '.json()' updated in pydantic 2.9.2. Check import path and argument signature.",
+      "source_url": "https://pypi.org/project/pydantic/1.10.12"
+    },
+    {
+      "symbol": ".parse_obj()",
+      "old_syntax": "# Legacy usage of .parse_obj()",
+      "new_syntax": "# Modern replacement for .parse_obj() in pydantic 2.9.2",
+      "required_imports": [],
+      "breaking_gotcha": "Symbol '.parse_obj()' updated in pydantic 2.9.2. Check import path and argument signature.",
+      "source_url": "https://pypi.org/project/pydantic/1.10.12"
+    },
+    {
+      "symbol": ".parse_raw()",
+      "old_syntax": "# Legacy usage of .parse_raw()",
+      "new_syntax": "# Modern replacement for .parse_raw() in pydantic 2.9.2",
+      "required_imports": [],
+      "breaking_gotcha": "Symbol '.parse_raw()' updated in pydantic 2.9.2. Check import path and argument signature.",
+      "source_url": "https://pypi.org/project/pydantic/1.10.12"
+    },
+    {
+      "symbol": ".schema_json()",
+      "old_syntax": "# Legacy usage of .schema_json()",
+      "new_syntax": "# Modern replacement for .schema_json() in pydantic 2.9.2",
+      "required_imports": [],
+      "breaking_gotcha": "Symbol '.schema_json()' updated in pydantic 2.9.2. Check import path and argument signature.",
+      "source_url": "https://pypi.org/project/pydantic/1.10.12"
     }
   ],
   "synthesized_by_model": "nvidia/nemotron-3-super-120b-a12b",
-  "generation_latency_ms": 13904.35,
+  "generation_latency_ms": 18249.19,
   "uncovered_symbols": [
-    ".as_openai_messages()",
-    ".construct()",
-    ".parse_obj()",
-    ".parse_raw()",
-    ".schema_json()",
     "@root_validator",
     "@root_validator(pre=True)",
     "@root_validator(skip_on_failure=True)",

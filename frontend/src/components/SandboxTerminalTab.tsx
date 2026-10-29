@@ -35,8 +35,12 @@ export function SandboxTerminalTab({
   const stdoutText = activeAttempt?.stdout_log ?? activeAttempt?.stdout ?? "";
   const stderrText = activeAttempt?.stderr_traceback ?? activeAttempt?.stderr ?? "";
 
+  const finalAttempt = attempts[attempts.length - 1];
+  const finalAttemptPassed = finalAttempt ? finalAttempt.exit_code === 0 : stage4Report?.final_status === "PASSED";
+  const healedAttempt = attempts.find((a) => Boolean(a.healed_file));
+  const showSelfHealBanner = Boolean(healedAttempt && healedAttempt.healed_file && finalAttemptPassed);
+
   const failedAttempt = attempts.find((a) => a.exit_code !== 0) || attempts[0];
-  const healedAttempt = attempts.find((a) => Boolean(a.healed_file)) || attempts[attempts.length - 1];
   const healedModel = healedAttempt?.healed_by_model || activeAttempt?.healed_by_model || "Nemotron Ultra";
   const healedFile = healedAttempt?.healed_file || activeAttempt?.healed_file || "patched files";
 
@@ -111,8 +115,8 @@ export function SandboxTerminalTab({
         )}
       </div>
 
-      {/* Autonomous Interception Highlight (When Attempt #1 fails and heals) */}
-      {hasMultipleAttempts && (
+      {/* Autonomous Interception Highlight (Only when attempt.healed_file is set and final attempt passed) */}
+      {showSelfHealBanner && (
         <div className="px-4 py-2.5 bg-gradient-to-r from-purple-950/40 via-indigo-950/30 to-slate-900/60 border-b border-purple-500/30 flex flex-col gap-2">
           <div className="flex items-center justify-between text-xs">
             <div className="flex items-center gap-2">
@@ -171,17 +175,17 @@ export function SandboxTerminalTab({
                 </div>
               ))}
             </div>
-          ) : activeAttempt?.healed_file ? (
+          ) : (activeAttempt?.healed_file || healedAttempt?.healed_file) ? (
             <div className="p-2 rounded bg-slate-900/80 border border-purple-500/30 text-[10px] space-y-1">
               <div className="text-purple-300 font-bold flex items-center gap-1">
                 <CornerDownRight className="w-3 h-3 text-purple-400" />
                 Autonomous Patch Applied:
               </div>
               <div className="pl-4 text-slate-300 flex flex-wrap gap-2">
-                <span className="text-cyan-400 font-mono">[{activeAttempt.healed_file}]</span>
+                <span className="text-cyan-400 font-mono">[{activeAttempt?.healed_file || healedAttempt?.healed_file}]</span>
                 <span>Interception healed semantic drift edge cases</span>
                 <span className="text-purple-400 font-mono">
-                  via {activeAttempt.healed_by_model || healedModel}
+                  via {activeAttempt?.healed_by_model || healedAttempt?.healed_by_model || healedModel}
                 </span>
               </div>
             </div>

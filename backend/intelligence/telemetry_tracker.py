@@ -13,6 +13,7 @@ from backend.schemas.migration_models import TelemetryEvent
 @dataclass
 class PipelineTelemetrySummary:
     total_events: int = 0
+    codemod_calls: int = 0
     super_calls: int = 0
     ultra_calls: int = 0
     total_prompt_tokens: int = 0
@@ -28,7 +29,9 @@ class PipelineTelemetrySummary:
     def record_event(self, event: TelemetryEvent) -> None:
         self.events.append(event)
         self.total_events += 1
-        if "SUPER" in event.assigned_tier.upper():
+        if event.model_used == "LIBCST_DETERMINISTIC_CODEMOD" or getattr(event, "execution_mode", "") == "LIBCST_DETERMINISTIC_CODEMOD":
+            self.codemod_calls += 1
+        elif "SUPER" in event.assigned_tier.upper():
             self.super_calls += 1
         else:
             self.ultra_calls += 1
@@ -49,6 +52,7 @@ class PipelineTelemetrySummary:
     def to_dict(self) -> Dict:
         return {
             "total_events": self.total_events,
+            "codemod_calls": self.codemod_calls,
             "super_calls": self.super_calls,
             "ultra_calls": self.ultra_calls,
             "total_prompt_tokens": self.total_prompt_tokens,
