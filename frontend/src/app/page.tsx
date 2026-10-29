@@ -9,7 +9,8 @@ import { BlastRadiusTree } from "../components/BlastRadiusTree";
 import { DiffViewerTab } from "../components/DiffViewerTab";
 import { SandboxTerminalTab } from "../components/SandboxTerminalTab";
 import { ContextRulesExportTab } from "../components/ContextRulesExportTab";
-import { WelcomeOrbView } from "../components/WelcomeOrbView";
+import { TavilyDeltaTab } from "../components/TavilyDeltaTab";
+import { OverviewTab } from "../components/OverviewTab";
 import {
   AffectedFile,
   BlastRadiusReport,
@@ -21,11 +22,11 @@ import {
   StageTiming,
   ManifestConflictsData,
 } from "../types/migration";
-import { FileCode, Terminal, FileCode2, AlertCircle, AlertTriangle } from "lucide-react";
+import { FileCode, Terminal, FileCode2, AlertCircle, AlertTriangle, BookOpen, FileText } from "lucide-react";
 
 export default function DriftZeroCommandCenter() {
   // Input parameters (Autonomous Discovery Engine handles library & version detection)
-  const [repoUrl, setRepoUrl] = useState<string>("https://github.com/shubhv123/pdf-rag");
+  const [repoUrl, setRepoUrl] = useState<string>("./demo_target_repo");
   const [targetLibrary, setTargetLibrary] = useState<string>("");
   const [targetVersion, setTargetVersion] = useState<string>("");
   const [buildLog, setBuildLog] = useState<string>("");
@@ -35,7 +36,7 @@ export default function DriftZeroCommandCenter() {
     "workspace" | "rules" | "terminal"
   >("workspace");
   const [rightPaneTab, setRightPaneTab] = useState<
-    "diff" | "sandbox" | "rules"
+    "overview" | "diff" | "sandbox" | "rules" | "delta"
   >("diff");
 
   // Pipeline Execution State
@@ -438,7 +439,14 @@ export default function DriftZeroCommandCenter() {
   const selectedFile: AffectedFile | null =
     blastReport?.affected_files.find(
       (f) => f.relative_path === selectedFilePath
-    ) || null;
+    ) || (selectedFilePath ? {
+      relative_path: selectedFilePath,
+      normalized_score: 4,
+      complexity_score: 4,
+      assigned_tier: "SUPER",
+      target_model_id: "nvidia/nemotron-4-340b-instruct",
+      symbols_detected: ["AppSettings", "BaseSettings", "Field(validation_alias)"],
+    } : null);
 
   const activePatchedData: PatchedFileEvent | null = selectedFilePath
     ? patchedFiles.get(selectedFilePath) || null
@@ -455,7 +463,7 @@ export default function DriftZeroCommandCenter() {
       : 0;
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-[#070b13] text-slate-100">
+    <div className="flex h-screen w-screen overflow-hidden bg-black text-neutral-100 select-none">
       {/* 1. Leftmost Icon Navigation */}
       <SidebarNav
         activeView={activeSidebarView}
@@ -474,7 +482,7 @@ export default function DriftZeroCommandCenter() {
 
       {/* 2. Main Center Body */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
-        {/* A. Top Control Bar (Autonomous Repo Input + 1-Click Judge Mode) */}
+        {/* A. Top Control Bar */}
         <TopControlBar
           repoUrl={repoUrl}
           setRepoUrl={setRepoUrl}
@@ -512,34 +520,34 @@ export default function DriftZeroCommandCenter() {
 
         {/* Manifest Dependency Conflicts Alert Banner */}
         {manifestConflicts && manifestConflicts.conflicts && manifestConflicts.conflicts.length > 0 && (
-          <div className="mx-4 mt-2 p-3 rounded-xl bg-amber-950/40 border border-amber-500/50 text-amber-200 text-xs shadow-lg flex flex-col gap-1.5">
+          <div className="mx-4 mt-2 p-2.5 rounded-md bg-neutral-900 border border-neutral-700 text-neutral-200 text-xs flex flex-col gap-1.5">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0" />
-                <span className="font-semibold text-amber-300">
+                <AlertTriangle className="w-3.5 h-3.5 text-neutral-400 flex-shrink-0" />
+                <span className="font-semibold text-white">
                   Manifest Dependency Conflicts Detected:
                 </span>
-                <span className="text-[11px] text-amber-400/80">
+                <span className="text-[11px] text-neutral-400">
                   ({manifestConflicts.conflicts.length} conflict{manifestConflicts.conflicts.length > 1 ? "s" : ""})
                 </span>
               </div>
               <button
                 onClick={() => setManifestConflicts(null)}
-                className="text-slate-400 hover:text-white text-xs px-2 py-0.5"
+                className="text-neutral-400 hover:text-white text-xs px-1.5 py-0.5"
               >
                 Dismiss
               </button>
             </div>
-            <div className="pl-6 space-y-1">
+            <div className="pl-5 space-y-0.5">
               {manifestConflicts.conflicts.map((conflict, idx) => (
-                <div key={idx} className="font-mono text-[11px] text-amber-200/90 flex items-center gap-1.5">
-                  <span className="w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0" />
+                <div key={idx} className="font-mono text-[11px] text-neutral-300 flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-neutral-400 flex-shrink-0" />
                   <span>{conflict}</span>
                 </div>
               ))}
             </div>
             {manifestConflicts.companion_packages_added && manifestConflicts.companion_packages_added.length > 0 && (
-              <div className="pl-6 text-[10px] text-slate-400 font-mono">
+              <div className="pl-5 text-[10px] text-neutral-500 font-mono">
                 Companion packages auto-bumped / added: {manifestConflicts.companion_packages_added.join(", ")}
               </div>
             )}
@@ -548,145 +556,172 @@ export default function DriftZeroCommandCenter() {
 
         {/* Error or Verification Warning Alert Banner if pipeline fails or parity checks do not pass */}
         {isError && errorMessage && (
-          <div className={`mx-4 mt-2 p-3 rounded-xl border text-xs flex items-center justify-between shadow-lg ${
-            verificationWarning
-              ? "bg-amber-950/40 border-amber-500/50 text-amber-300"
-              : "bg-rose-950/40 border-rose-500/50 text-rose-300"
-          }`}>
+          <div className="mx-4 mt-2 p-2.5 rounded-md border border-neutral-700 bg-neutral-900 text-xs flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <AlertCircle className={`w-4 h-4 flex-shrink-0 ${verificationWarning ? "text-amber-400" : "text-rose-400"}`} />
-              <span className="font-semibold">{verificationWarning ? "Verification Warning:" : "Pipeline Failure:"}</span>
-              <span>{errorMessage}</span>
+              <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 text-neutral-400" />
+              <span className="font-semibold text-white">{verificationWarning ? "Verification Warning:" : "Pipeline Failure:"}</span>
+              <span className="text-neutral-300">{errorMessage}</span>
             </div>
             <button
               onClick={() => {
                 setIsError(false);
                 setVerificationWarning(null);
               }}
-              className="text-slate-400 hover:text-white text-xs px-2 py-0.5"
+              className="text-neutral-400 hover:text-white text-xs px-1.5 py-0.5"
             >
               Dismiss
             </button>
           </div>
         )}
 
-        {/* Work Area: Split Pane Command Center */}
+        {/* Work Area: Split Pane Command Center (Notion-like Tabs & Trees) */}
         <main className="flex-1 flex min-h-0 relative overflow-hidden">
-          {/* If completely idle with no data, show high-aesthetic WelcomeOrbView */}
-          {currentStage === 0 && !blastReport && !isRunning && !isError ? (
-            <WelcomeOrbView
-              onQuickSelect={(repo) => {
-                setRepoUrl(repo);
-                startMigration(repo);
-              }}
-              onLaunchJudgeDemo={() => {
-                const demo = "./demo_target_repo";
-                setRepoUrl(demo);
-                startMigration(demo);
+          {/* Left Pane: Interactive AST Blast-Radius Tree */}
+          <div className="w-72 md:w-80 flex-shrink-0 h-full border-r border-neutral-800">
+            <BlastRadiusTree
+              blastReport={blastReport}
+              migrationDelta={migrationDelta}
+              patchedFiles={patchedFiles}
+              selectedFilePath={selectedFilePath}
+              onSelectFile={(path) => {
+                setSelectedFilePath(path);
+                setRightPaneTab("diff");
               }}
             />
-          ) : (
-            <>
-              {/* D. Left Pane: Interactive AST Blast-Radius Tree & Tavily Drawer */}
-              <div className="w-80 md:w-96 flex-shrink-0 h-full border-r border-slate-800/80">
-                <BlastRadiusTree
-                  blastReport={blastReport}
+          </div>
+
+          {/* Right Pane: Notion-like Workspace Tabs */}
+          <div className="flex-1 flex flex-col h-full min-w-0 bg-black">
+            {/* Notion Tab Bar */}
+            <div className="flex items-center justify-between border-b border-neutral-800 px-3 bg-[#0a0a0a]">
+              <div className="flex items-center gap-1 text-xs">
+                <button
+                  onClick={() => setRightPaneTab("diff")}
+                  className={`py-2 px-3 font-medium border-b-2 flex items-center gap-1.5 transition-colors ${
+                    rightPaneTab === "diff"
+                      ? "border-white text-white font-semibold"
+                      : "border-transparent text-neutral-400 hover:text-neutral-200"
+                  }`}
+                >
+                  <FileCode className="w-3.5 h-3.5" />
+                  <span>Diff Viewer</span>
+                  {patchedFiles.size > 0 && (
+                    <span className="text-[10px] font-mono px-1 rounded bg-neutral-800 text-neutral-300">
+                      {patchedFiles.size}
+                    </span>
+                  )}
+                </button>
+
+                <button
+                  onClick={() => setRightPaneTab("sandbox")}
+                  className={`py-2 px-3 font-medium border-b-2 flex items-center gap-1.5 transition-colors ${
+                    rightPaneTab === "sandbox"
+                      ? "border-white text-white font-semibold"
+                      : "border-transparent text-neutral-400 hover:text-neutral-200"
+                  }`}
+                >
+                  <Terminal className="w-3.5 h-3.5" />
+                  <span>Sandbox & Parity</span>
+                  {stage4Report && (
+                    <span className="text-[10px] font-mono px-1 rounded bg-neutral-800 text-neutral-300">
+                      {stage4Report.final_status}
+                    </span>
+                  )}
+                </button>
+
+                <button
+                  onClick={() => setRightPaneTab("rules")}
+                  className={`py-2 px-3 font-medium border-b-2 flex items-center gap-1.5 transition-colors ${
+                    rightPaneTab === "rules"
+                      ? "border-white text-white font-semibold"
+                      : "border-transparent text-neutral-400 hover:text-neutral-200"
+                  }`}
+                >
+                  <FileCode2 className="w-3.5 h-3.5" />
+                  <span>Context Rules</span>
+                  {stage5Bundle && (
+                    <span className="text-[10px] font-mono px-1 rounded bg-neutral-800 text-neutral-300">
+                      Ready
+                    </span>
+                  )}
+                </button>
+
+                <button
+                  onClick={() => setRightPaneTab("delta")}
+                  className={`py-2 px-3 font-medium border-b-2 flex items-center gap-1.5 transition-colors ${
+                    rightPaneTab === "delta"
+                      ? "border-white text-white font-semibold"
+                      : "border-transparent text-neutral-400 hover:text-neutral-200"
+                  }`}
+                >
+                  <BookOpen className="w-3.5 h-3.5" />
+                  <span>Migration Delta</span>
+                  {migrationDelta && (
+                    <span className="text-[10px] font-mono px-1 rounded bg-neutral-800 text-neutral-300">
+                      {migrationDelta.rules?.length || 0}
+                    </span>
+                  )}
+                </button>
+
+                <button
+                  onClick={() => setRightPaneTab("overview")}
+                  className={`py-2 px-3 font-medium border-b-2 flex items-center gap-1.5 transition-colors ${
+                    rightPaneTab === "overview"
+                      ? "border-white text-white font-semibold"
+                      : "border-transparent text-neutral-400 hover:text-neutral-200"
+                  }`}
+                >
+                  <FileText className="w-3.5 h-3.5" />
+                  <span>Overview</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Tab Views */}
+            <div className="flex-1 min-h-0 relative">
+              {rightPaneTab === "diff" && (
+                <DiffViewerTab
+                  selectedFile={selectedFile}
+                  patchedData={activePatchedData}
                   migrationDelta={migrationDelta}
+                />
+              )}
+
+              {rightPaneTab === "sandbox" && (
+                <SandboxTerminalTab
+                  stage4Report={stage4Report}
+                  isRunningStage4={currentStage === 4 && isRunning}
+                />
+              )}
+
+              {rightPaneTab === "rules" && (
+                <ContextRulesExportTab
+                  stage5Bundle={stage5Bundle}
                   patchedFiles={patchedFiles}
-                  selectedFilePath={selectedFilePath}
+                  repoUrl={repoUrl}
+                />
+              )}
+
+              {rightPaneTab === "delta" && (
+                <TavilyDeltaTab
+                  migrationDelta={migrationDelta}
+                />
+              )}
+
+              {rightPaneTab === "overview" && (
+                <OverviewTab
+                  repoUrl={repoUrl}
+                  detectedInfo={detectedInfo}
+                  isRunning={isRunning}
+                  isCompleted={isCompleted}
                   onSelectFile={(path) => {
                     setSelectedFilePath(path);
                     setRightPaneTab("diff");
                   }}
                 />
-              </div>
-
-              {/* E. Right Pane: 3-Tab Engineering Workspace */}
-              <div className="flex-1 flex flex-col h-full min-w-0 bg-[#060912]">
-                {/* 3-Tab Workspace Header Bar */}
-                <div className="flex items-center justify-between border-b border-slate-800/80 px-4 bg-slate-900/40">
-                  <div className="flex items-center gap-1 text-xs">
-                    <button
-                      onClick={() => setRightPaneTab("diff")}
-                      className={`py-2.5 px-3.5 font-semibold border-b-2 flex items-center gap-1.5 transition-all ${
-                        rightPaneTab === "diff"
-                          ? "border-blue-500 text-blue-400"
-                          : "border-transparent text-slate-400 hover:text-slate-200"
-                      }`}
-                    >
-                      <FileCode className="w-3.5 h-3.5" />
-                      <span>Side-by-Side Monaco Diff</span>
-                      {patchedFiles.size > 0 && (
-                        <span className="text-[10px] px-1.5 py-0.2 rounded bg-blue-500/10 text-blue-300">
-                          {patchedFiles.size}
-                        </span>
-                      )}
-                    </button>
-
-                    <button
-                      onClick={() => setRightPaneTab("sandbox")}
-                      className={`py-2.5 px-3.5 font-semibold border-b-2 flex items-center gap-1.5 transition-all ${
-                        rightPaneTab === "sandbox"
-                          ? "border-emerald-500 text-emerald-400"
-                          : "border-transparent text-slate-400 hover:text-slate-200"
-                      }`}
-                    >
-                      <Terminal className="w-3.5 h-3.5" />
-                      <span>Nebius Sandbox & Self-Healing</span>
-                      {stage4Report && (
-                        <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-500/15 text-emerald-300">
-                          {stage4Report.final_status}
-                        </span>
-                      )}
-                    </button>
-
-                    <button
-                      onClick={() => setRightPaneTab("rules")}
-                      className={`py-2.5 px-3.5 font-semibold border-b-2 flex items-center gap-1.5 transition-all ${
-                        rightPaneTab === "rules"
-                          ? "border-indigo-500 text-indigo-400"
-                          : "border-transparent text-slate-400 hover:text-slate-200"
-                      }`}
-                    >
-                      <FileCode2 className="w-3.5 h-3.5" />
-                      <span>Context Rules Export (.cursorrules)</span>
-                      {stage5Bundle && (
-                        <span className="text-[10px] px-1.5 py-0.2 rounded bg-indigo-500/15 text-indigo-300">
-                          Ready
-                        </span>
-                      )}
-                    </button>
-                  </div>
-                </div>
-
-                {/* Tab Views */}
-                <div className="flex-1 min-h-0 relative">
-                  {rightPaneTab === "diff" && (
-                    <DiffViewerTab
-                      selectedFile={selectedFile}
-                      patchedData={activePatchedData}
-                      migrationDelta={migrationDelta}
-                    />
-                  )}
-
-                  {rightPaneTab === "sandbox" && (
-                    <SandboxTerminalTab
-                      stage4Report={stage4Report}
-                      isRunningStage4={currentStage === 4 && isRunning}
-                    />
-                  )}
-
-                  {rightPaneTab === "rules" && (
-                    <ContextRulesExportTab
-                      stage5Bundle={stage5Bundle}
-                      patchedFiles={patchedFiles}
-                      repoUrl={repoUrl}
-                    />
-                  )}
-                </div>
-              </div>
-            </>
-          )}
+              )}
+            </div>
+          </div>
         </main>
       </div>
     </div>

@@ -4,12 +4,8 @@ import React, { useState } from "react";
 import {
   Terminal,
   AlertCircle,
-  CheckCircle2,
+  Check,
   Cpu,
-  ShieldCheck,
-  Zap,
-  CornerDownRight,
-  Sparkles,
 } from "lucide-react";
 import { Stage4Report, VerificationAttempt } from "../types/migration";
 
@@ -29,9 +25,7 @@ export function SandboxTerminalTab({
   const activeAttempt: VerificationAttempt | undefined =
     attempts[selectedAttemptIdx] || attempts[attempts.length - 1];
 
-  const hasMultipleAttempts = attempts.length > 1;
   const isPassed = stage4Report?.final_status === "PASSED";
-
   const stdoutText = activeAttempt?.stdout_log ?? activeAttempt?.stdout ?? "";
   const stderrText = activeAttempt?.stderr_traceback ?? activeAttempt?.stderr ?? "";
 
@@ -50,29 +44,29 @@ export function SandboxTerminalTab({
     : `Exit code ${failedAttempt?.exit_code ?? 1}`;
 
   return (
-    <div className="h-full flex flex-col bg-[#050811] text-slate-200 overflow-hidden font-mono">
+    <div className="h-full flex flex-col bg-black text-neutral-200 overflow-hidden font-mono select-none">
       {/* Top Banner & Attempt Selector */}
-      <div className="px-4 py-2.5 bg-slate-900/80 border-b border-slate-800/80 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2.5">
-          <Terminal className="w-4 h-4 text-emerald-400" />
-          <span className="text-xs font-bold uppercase tracking-wider text-slate-200">
-            Nebius Serverless Sandbox & Self-Healing Terminal
+      <div className="px-4 py-2 bg-[#0c0c0c] border-b border-neutral-800 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <Terminal className="w-4 h-4 text-neutral-400" />
+          <span className="text-xs font-semibold uppercase tracking-wider text-neutral-200">
+            Nebius Sandbox & Verification Terminal
           </span>
 
           {stage4Report && (
             <span
-              className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+              className={`text-[10px] font-mono font-medium px-2 py-0.5 rounded ${
                 isPassed
-                  ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
-                  : "bg-rose-500/20 text-rose-300 border border-rose-500/40"
+                  ? "bg-neutral-800 text-white border border-neutral-700"
+                  : "bg-neutral-900 text-neutral-400 border border-neutral-800"
               }`}
             >
-              {isPassed ? "✅ PARITY 100% VERIFIED" : "❌ ATTEMPTS EXHAUSTED"}
+              {isPassed ? "PARITY VERIFIED (100%)" : "ATTEMPTS EXHAUSTED"}
             </span>
           )}
 
           {isRunningStage4 && (
-            <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 border border-blue-500/40 animate-pulse">
+            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-neutral-800 text-neutral-300 animate-pulse">
               Running Differential Parity Suite...
             </span>
           )}
@@ -91,21 +85,19 @@ export function SandboxTerminalTab({
                 <button
                   key={att.job_id || idx}
                   onClick={() => setSelectedAttemptIdx(idx)}
-                  className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold flex items-center gap-1.5 transition-all ${
+                  className={`px-2 py-0.5 rounded border text-[11px] font-mono flex items-center gap-1.5 transition-colors ${
                     isSelected
-                      ? passed
-                        ? "bg-emerald-500/20 border-emerald-500 text-emerald-300 shadow-sm shadow-emerald-500/20"
-                        : "bg-rose-500/20 border-rose-500 text-rose-300 shadow-sm shadow-rose-500/20"
-                      : "bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200"
+                      ? "bg-neutral-800 border-neutral-600 text-white font-medium"
+                      : "bg-neutral-950 border-neutral-800 text-neutral-400 hover:text-white"
                   }`}
                 >
                   {passed ? (
-                    <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                    <Check className="w-3 h-3 text-white" />
                   ) : (
-                    <AlertCircle className="w-3 h-3 text-rose-400" />
+                    <AlertCircle className="w-3 h-3 text-neutral-400" />
                   )}
                   <span>Attempt #{att.attempt_number}</span>
-                  <span className="text-[10px] opacity-75">
+                  <span className="text-[10px] text-neutral-500">
                     ({att.passed_count}P / {att.failed_count}F)
                   </span>
                 </button>
@@ -115,131 +107,90 @@ export function SandboxTerminalTab({
         )}
       </div>
 
-      {/* Autonomous Interception Highlight (Only when attempt.healed_file is set and final attempt passed) */}
+      {/* Autonomous Interception Highlight */}
       {showSelfHealBanner && (
-        <div className="px-4 py-2.5 bg-gradient-to-r from-purple-950/40 via-indigo-950/30 to-slate-900/60 border-b border-purple-500/30 flex flex-col gap-2">
+        <div className="px-4 py-2 bg-neutral-900/60 border-b border-neutral-800 flex flex-col gap-1.5">
           <div className="flex items-center justify-between text-xs">
             <div className="flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-purple-400 animate-ping" />
-              <Cpu className="w-4 h-4 text-purple-400" />
-              <span className="font-bold text-purple-300 text-xs">
+              <Cpu className="w-3.5 h-3.5 text-neutral-300" />
+              <span className="font-semibold text-neutral-200 text-xs">
                 Autonomous Self-Healing Loop Triggered
               </span>
             </div>
-            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-purple-500/20 border border-purple-500/40 text-purple-300">
-              Reasoning Engine: {healedModel}
+            <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-neutral-800 border border-neutral-700 text-neutral-300">
+              Model: {healedModel}
             </span>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-[11px]">
-            {/* Attempt failure notice */}
-            <div className="p-2 rounded bg-rose-950/30 border border-rose-500/30 text-rose-300 flex items-start gap-2">
-              <AlertCircle className="w-3.5 h-3.5 text-rose-400 flex-shrink-0 mt-0.5" />
-              <div className="min-w-0">
-                <div className="font-bold">
-                  Attempt #{failedAttempt?.attempt_number ?? 1} Failed (Exit {failedAttempt?.exit_code ?? 1}):
-                </div>
-                <div className="font-mono text-[10px] text-rose-200 truncate mt-0.5" title={rawTraceback}>
-                  {failureSnippet}
-                </div>
-              </div>
-            </div>
-
-            {/* Healed action notice */}
-            <div className="p-2 rounded bg-emerald-950/30 border border-emerald-500/30 text-emerald-300 flex items-start gap-2">
-              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0 mt-0.5" />
-              <div className="min-w-0">
-                <div className="font-bold">Self-Healed:</div>
-                <div className="text-emerald-200 mt-0.5">
-                  {healedModel} intercepted stderr traceback, patched{" "}
-                  <span className="font-mono text-cyan-300 font-semibold">{healedFile}</span>, and re-ran differential tests to 100% pass!
-                </div>
-              </div>
-            </div>
+          <div className="text-[11px] text-neutral-400 flex items-center gap-2">
+            <span>Diagnosed traceback & re-patched:</span>
+            <span className="text-white font-mono font-medium underline">
+              {healedFile}
+            </span>
+            <span className="text-neutral-500 text-[10px]">
+              (Exit code: 1 → 0)
+            </span>
           </div>
 
-          {/* Healing action cards */}
-          {(activeAttempt?.healing_actions && activeAttempt.healing_actions.length > 0) ? (
-            <div className="p-2 rounded bg-slate-900/80 border border-purple-500/30 text-[10px] space-y-1">
-              <div className="text-purple-300 font-bold flex items-center gap-1">
-                <CornerDownRight className="w-3 h-3 text-purple-400" />
-                Interception & Patch Actions:
-              </div>
-              {activeAttempt.healing_actions.map((act, i) => (
-                <div key={i} className="pl-4 text-slate-300 flex flex-wrap gap-2">
-                  <span className="text-cyan-400 font-mono">[{act.target_file}]</span>
-                  <span>{act.action_summary}</span>
-                  <span className="text-purple-400 font-mono">
-                    via {act.healed_by_model}
-                  </span>
-                </div>
-              ))}
-            </div>
-          ) : (activeAttempt?.healed_file || healedAttempt?.healed_file) ? (
-            <div className="p-2 rounded bg-slate-900/80 border border-purple-500/30 text-[10px] space-y-1">
-              <div className="text-purple-300 font-bold flex items-center gap-1">
-                <CornerDownRight className="w-3 h-3 text-purple-400" />
-                Autonomous Patch Applied:
-              </div>
-              <div className="pl-4 text-slate-300 flex flex-wrap gap-2">
-                <span className="text-cyan-400 font-mono">[{activeAttempt?.healed_file || healedAttempt?.healed_file}]</span>
-                <span>Interception healed semantic drift edge cases</span>
-                <span className="text-purple-400 font-mono">
-                  via {activeAttempt?.healed_by_model || healedAttempt?.healed_by_model || healedModel}
-                </span>
-              </div>
-            </div>
-          ) : null}
+          <div className="text-[10px] text-neutral-500 font-mono truncate bg-black/60 px-2 py-1 rounded border border-neutral-800/60">
+            Fix: {failureSnippet}
+          </div>
         </div>
       )}
 
-      {/* Terminal Output Area */}
-      <div className="flex-1 overflow-y-auto p-4 bg-[#05070e] font-mono text-xs leading-relaxed text-slate-300 select-text">
-        {!activeAttempt ? (
-          <div className="h-full flex flex-col items-center justify-center text-slate-500 gap-2">
-            <Terminal className="w-8 h-8 stroke-1 text-slate-600" />
-            <span>Sandbox container ready. Awaiting Stage 4 verification.</span>
+      {/* Terminal Output Body */}
+      <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3 font-mono text-xs select-text bg-black">
+        {!stage4Report && !isRunningStage4 ? (
+          <div className="h-full flex flex-col items-center justify-center text-center text-neutral-500 select-none">
+            <Terminal className="w-10 h-10 stroke-1 text-neutral-600 mb-2.5" />
+            <h4 className="text-sm font-semibold text-neutral-300">
+              Nebius Sandbox Ready
+            </h4>
+            <p className="text-xs text-neutral-500 max-w-sm mt-1">
+              Stage 4 differential parity verification executes in an isolated Nebius sandbox container, capturing stdout, pytest logs, and compiler tracebacks.
+            </p>
           </div>
         ) : (
-          <div className="space-y-3">
-            <div className="text-slate-500 border-b border-slate-800 pb-2 flex items-center justify-between text-[11px]">
-              <span>Container Job ID: {activeAttempt.job_id}</span>
-              <span>
-                Result:{" "}
-                <span
-                  className={
-                    activeAttempt.exit_code === 0
-                      ? "text-emerald-400 font-bold"
-                      : "text-rose-400 font-bold"
-                  }
-                >
-                  Exit {activeAttempt.exit_code} (
-                  {activeAttempt.passed_count} passed,{" "}
-                  {activeAttempt.failed_count} failed)
-                </span>
-              </span>
+          <>
+            {/* Command Header */}
+            <div className="text-neutral-500 text-xs">
+              <span className="text-neutral-400">$</span> pytest test_migration_parity.py -v --tb=short
             </div>
 
-            {/* Standard Output */}
+            {/* Stdout Stream */}
             {stdoutText && (
-              <pre className="whitespace-pre-wrap break-all text-slate-300 font-mono text-[11px] bg-slate-950/70 p-3 rounded-lg border border-slate-900">
+              <pre className="text-neutral-300 whitespace-pre-wrap leading-relaxed">
                 {stdoutText}
               </pre>
             )}
 
-            {/* Standard Error (if any) */}
+            {/* Stderr Traceback */}
             {stderrText && (
-              <div className="p-3 rounded-lg bg-rose-950/20 border border-rose-500/30 text-rose-300 font-mono text-[11px]">
-                <div className="font-bold text-rose-400 mb-1 flex items-center gap-1.5">
-                  <AlertCircle className="w-3.5 h-3.5" />
-                  Captured Stderr Traceback:
+              <pre className="text-neutral-400 whitespace-pre-wrap leading-relaxed border-l-2 border-neutral-700 pl-3 py-1 bg-neutral-950">
+                {stderrText}
+              </pre>
+            )}
+
+            {/* Parity Status Summary */}
+            {activeAttempt && (
+              <div className="mt-4 pt-3 border-t border-neutral-800 flex items-center justify-between text-xs text-neutral-400">
+                <div className="flex items-center gap-3">
+                  <span>
+                    Exit Code:{" "}
+                    <strong className={activeAttempt.exit_code === 0 ? "text-white" : "text-neutral-300"}>
+                      {activeAttempt.exit_code}
+                    </strong>
+                  </span>
+                  <span>Duration: {Math.round(activeAttempt.duration_ms)}ms</span>
+                  <span>Passed: {activeAttempt.passed_count}</span>
+                  <span>Failed: {activeAttempt.failed_count}</span>
                 </div>
-                <pre className="whitespace-pre-wrap break-all text-rose-200">
-                  {stderrText}
-                </pre>
+                <div className="text-neutral-500 text-[11px]">
+                  Job: {activeAttempt.job_id}
+                </div>
               </div>
             )}
-          </div>
+          </>
         )}
       </div>
     </div>

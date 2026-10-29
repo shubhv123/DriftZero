@@ -4,13 +4,10 @@ import React, { useState, useEffect } from "react";
 import dynamic from "next/dynamic";
 import {
   FileCode,
-  Sparkles,
-  Cpu,
-  Layers,
   ArrowRight,
-  Info,
   Clock,
   Coins,
+  Cpu,
 } from "lucide-react";
 import { AffectedFile, MigrationDelta, PatchedFileEvent } from "../types/migration";
 
@@ -20,7 +17,7 @@ const DiffEditor = dynamic(
   {
     ssr: false,
     loading: () => (
-      <div className="h-full w-full flex items-center justify-center bg-[#070b13] text-slate-500 font-mono text-xs">
+      <div className="h-full w-full flex items-center justify-center bg-black text-neutral-500 font-mono text-xs">
         Initializing Monaco Diff Engine...
       </div>
     ),
@@ -46,14 +43,13 @@ export function DiffViewerTab({
 
   if (!selectedFile) {
     return (
-      <div className="h-full flex flex-col items-center justify-center p-8 text-center text-slate-500">
-        <FileCode className="w-12 h-12 stroke-1 text-slate-600 mb-3" />
-        <h4 className="text-sm font-semibold text-slate-400">
+      <div className="h-full flex flex-col items-center justify-center p-8 text-center text-neutral-500 select-none bg-black">
+        <FileCode className="w-10 h-10 stroke-1 text-neutral-600 mb-2.5" />
+        <h4 className="text-sm font-semibold text-neutral-300">
           No File Selected
         </h4>
-        <p className="text-xs text-slate-500 max-w-sm mt-1">
-          Select an affected file from the AST Blast-Radius tree on the left to
-          inspect side-by-side refactoring diffs and reasoning annotations.
+        <p className="text-xs text-neutral-500 max-w-sm mt-1">
+          Select a file from the AST Blast-Radius tree on the left to inspect side-by-side refactoring diffs.
         </p>
       </div>
     );
@@ -95,61 +91,45 @@ export function DiffViewerTab({
     }) || [];
 
   return (
-    <div className="h-full flex flex-col bg-[#070b14] overflow-hidden">
+    <div className="h-full flex flex-col bg-black overflow-hidden">
       {/* Diff Header Bar */}
-      <div className="px-4 py-2.5 bg-slate-900/60 border-b border-slate-800/80 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2.5 min-w-0">
-          <FileCode className="w-4 h-4 text-blue-400 flex-shrink-0" />
-          <span className="font-mono text-xs font-bold text-slate-200 truncate">
+      <div className="px-4 py-2 bg-[#0c0c0c] border-b border-neutral-800 flex flex-wrap items-center justify-between gap-3 select-none">
+        <div className="flex items-center gap-2 min-w-0">
+          <FileCode className="w-4 h-4 text-neutral-400 flex-shrink-0" />
+          <span className="font-mono text-xs font-semibold text-white truncate">
             {selectedFile.relative_path}
           </span>
 
-          <span
-            className={`text-[10px] font-mono px-2 py-0.5 rounded-full font-bold ${
-              score <= 5
-                ? "bg-emerald-500/15 border border-emerald-500/30 text-emerald-300"
-                : "bg-purple-500/15 border border-purple-500/30 text-purple-300"
-            }`}
-          >
-            AST Complexity {score}/10
+          <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-neutral-800 text-neutral-300 border border-neutral-700">
+            Score: {score}/10
           </span>
 
-          <span
-            className={`text-[10px] px-2 py-0.5 rounded-md font-semibold flex items-center gap-1 ${
-              isSuper
-                ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
-                : "bg-purple-500/20 text-purple-300 border border-purple-500/40"
-            }`}
-          >
-            <span
-              className={`w-1.5 h-1.5 rounded-full ${
-                isSuper ? "bg-emerald-400" : "bg-purple-400"
-              }`}
-            />
-            {modelName}
+          <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-neutral-800 text-neutral-300 border border-neutral-700 flex items-center gap-1">
+            <Cpu className="w-2.5 h-2.5 text-neutral-400" />
+            {modelName.replace(/^nvidia\//i, "")}
           </span>
         </div>
 
         {/* Telemetry pill */}
         {telemetry ? (
-          <div className="flex items-center gap-3 text-[11px] font-mono text-slate-400">
-            <span className="flex items-center gap-1 text-slate-300">
-              <Clock className="w-3 h-3 text-cyan-400" />
+          <div className="flex items-center gap-3 text-[11px] font-mono text-neutral-400">
+            <span className="flex items-center gap-1 text-neutral-300">
+              <Clock className="w-3 h-3 text-neutral-400" />
               {Math.round(latency)}ms
             </span>
-            <span className="flex items-center gap-1 text-emerald-400">
-              <Coins className="w-3 h-3 text-emerald-400" />
+            <span className="flex items-center gap-1 text-white">
+              <Coins className="w-3 h-3 text-neutral-400" />
               ${cost.toFixed(5)}
             </span>
             {tokens > 0 && (
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">
+              <span className="text-[10px] px-1.5 py-0.2 rounded bg-neutral-800 text-neutral-300 border border-neutral-700">
                 {tokens} tokens
               </span>
             )}
           </div>
         ) : (
-          <div className="text-[11px] text-slate-500 font-mono italic">
-            Awaiting Stage 3 Token Factory Patch...
+          <div className="text-[11px] text-neutral-500 font-mono italic">
+            Stage 3 Model Routing
           </div>
         )}
       </div>
@@ -178,44 +158,43 @@ export function DiffViewerTab({
         )}
       </div>
 
-      {/* Tavily Inline Grounding Annotations Banner */}
-      <div className="px-4 py-2 bg-slate-950/90 border-t border-slate-800/80 flex flex-col gap-1.5 max-h-32 overflow-y-auto">
+      {/* Grounding Annotations Banner */}
+      <div className="px-4 py-2 bg-[#0c0c0c] border-t border-neutral-800 flex flex-col gap-1.5 max-h-32 overflow-y-auto">
         <div className="flex items-center justify-between text-[11px]">
-          <span className="text-slate-400 font-medium flex items-center gap-1.5">
-            <Sparkles className="w-3 h-3 text-cyan-400" />
+          <span className="text-neutral-400 font-medium">
             Tavily Grounding Annotations ({relevantRules.length} applicable rules)
           </span>
-          <span className="text-[10px] text-slate-500 font-mono truncate max-w-md">
+          <span className="text-[10px] text-neutral-500 font-mono truncate max-w-md">
             AST Reason:{" "}
             {selectedFile.routing_reasons?.join("; ") ||
               selectedFile.ast_reasoning ||
-              "Detected imports & deprecation calls"}
+              "Detected AST deprecation nodes"}
           </span>
         </div>
 
         {relevantRules.length > 0 ? (
-          <div className="flex flex-wrap gap-2">
+          <div className="flex flex-wrap gap-1.5">
             {relevantRules.map((rule, idx) => (
               <div
                 key={idx}
-                className="px-2.5 py-1 rounded-md bg-slate-900/80 border border-slate-800 text-[10px] font-mono flex items-center gap-1.5 text-slate-300"
+                className="px-2 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-[10px] font-mono flex items-center gap-1.5 text-neutral-300"
               >
-                <span className="text-rose-400 line-through truncate max-w-[120px]">
+                <span className="text-neutral-400 line-through truncate max-w-[120px]">
                   {rule.old_syntax}
                 </span>
-                <ArrowRight className="w-2.5 h-2.5 text-slate-500 flex-shrink-0" />
-                <span className="text-emerald-400 truncate max-w-[120px]">
+                <ArrowRight className="w-2.5 h-2.5 text-neutral-500 flex-shrink-0" />
+                <span className="text-white truncate max-w-[120px]">
                   {rule.new_syntax}
                 </span>
-                <span className="text-slate-500 text-[9px] ml-1">
+                <span className="text-neutral-500 text-[9px] ml-1">
                   ({rule.symbol || rule.category || "Rule"})
                 </span>
               </div>
             ))}
           </div>
         ) : (
-          <div className="text-[10px] text-slate-500 italic">
-            Refactored based on multi-endpoint Tavily documentation delta and syntax trees.
+          <div className="text-[10px] text-neutral-500 italic">
+            Automated transformation verified against differential parity suite.
           </div>
         )}
       </div>

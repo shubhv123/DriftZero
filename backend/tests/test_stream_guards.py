@@ -110,7 +110,8 @@ def test_concurrency_cap_post():
     assert success_resp.status_code == 200
 
 
-def test_allow_local_repos_env_default():
+def test_allow_local_repos_env_default(monkeypatch):
+    monkeypatch.delenv("ALLOW_LOCAL_REPOS", raising=False)
     from backend.core.repo_manager import prepare_repo_workspace
 
     # Ensure ALLOW_LOCAL_REPOS defaults to 0 and local directories are rejected

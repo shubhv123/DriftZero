@@ -2,8 +2,7 @@
 
 import React, { useEffect, useState } from "react";
 import {
-  CheckCircle2,
-  Clock,
+  Check,
   Loader2,
   AlertCircle,
   FileSearch,
@@ -24,31 +23,31 @@ interface PipelineStepperProps {
 const STAGES = [
   {
     id: 1,
-    title: "1. AST Blast-Radius",
-    desc: "Zero-Token AST Scan",
+    title: "1. AST Scan",
+    desc: "Blast-radius inspection",
     icon: FileSearch,
   },
   {
     id: 2,
-    title: "2. Tavily Live Delta",
-    desc: "Search & Synthesize",
+    title: "2. Live Delta",
+    desc: "Tavily search & rules",
     icon: Sparkles,
   },
   {
     id: 3,
-    title: "3. Token Factory Router",
-    desc: "Super / Ultra Tiered",
+    title: "3. Smart Router",
+    desc: "Super / Ultra tiering",
     icon: Cpu,
   },
   {
     id: 4,
-    title: "4. Nebius Sandbox & Heal",
-    desc: "Differential Parity",
+    title: "4. Nebius Sandbox",
+    desc: "Parity verification",
     icon: ShieldAlert,
   },
   {
     id: 5,
-    title: "5. Context Rules Export",
+    title: "5. Rules Export",
     desc: ".cursorrules & PR",
     icon: Download,
   },
@@ -60,7 +59,6 @@ export function PipelineStepper({
   isError,
   stageTimings,
 }: PipelineStepperProps) {
-  // Live tick for running stage elapsed duration
   const [now, setNow] = useState(Date.now());
 
   useEffect(() => {
@@ -91,9 +89,9 @@ export function PipelineStepper({
   };
 
   return (
-    <div className="w-full bg-[#0a0f1d]/80 border-b border-slate-800/60 px-4 py-2.5 overflow-x-auto">
-      <div className="flex items-center justify-between min-w-[760px] gap-2">
-        {STAGES.map((stage, idx) => {
+    <div className="w-full bg-[#0a0a0a] border-b border-neutral-800 px-4 py-2 overflow-x-auto select-none">
+      <div className="flex items-center justify-between min-w-[720px] gap-2">
+        {STAGES.map((stage) => {
           const isCurrent = stage.id === currentStage && !isCompleted && !isError;
           const isDone =
             stage.id < currentStage || (stage.id === 5 && isCompleted);
@@ -102,77 +100,54 @@ export function PipelineStepper({
           const Icon = stage.icon;
 
           return (
-            <React.Fragment key={stage.id}>
+            <div
+              key={stage.id}
+              className={`flex items-center gap-2 px-2.5 py-1.5 rounded-md border text-xs transition-colors flex-1 min-w-[130px] ${
+                isFailed
+                  ? "bg-neutral-900 border-neutral-700 text-neutral-200"
+                  : isCurrent
+                  ? "bg-neutral-800 border-neutral-600 text-white font-medium"
+                  : isDone
+                  ? "bg-neutral-900/60 border-neutral-800/80 text-neutral-300"
+                  : "bg-transparent border-transparent text-neutral-500"
+              }`}
+            >
               <div
-                className={`flex items-center gap-2 px-3 py-1.5 rounded-xl border transition-all ${
+                className={`w-5 h-5 rounded flex items-center justify-center flex-shrink-0 text-xs ${
                   isFailed
-                    ? "bg-rose-950/30 border-rose-500/50 text-rose-300"
+                    ? "bg-neutral-800 text-neutral-300"
                     : isCurrent
-                    ? "bg-blue-600/15 border-blue-500/60 text-blue-300 shadow-sm shadow-blue-500/20"
+                    ? "bg-white text-black font-bold"
                     : isDone
-                    ? "bg-emerald-950/20 border-emerald-500/40 text-emerald-300"
-                    : "bg-slate-900/40 border-slate-800/40 text-slate-500"
+                    ? "bg-neutral-800 text-neutral-300"
+                    : "bg-neutral-900 text-neutral-600"
                 }`}
               >
-                <div
-                  className={`w-6 h-6 rounded-lg flex items-center justify-center flex-shrink-0 text-xs font-bold ${
-                    isFailed
-                      ? "bg-rose-500/20 text-rose-400"
-                      : isCurrent
-                      ? "bg-blue-500 text-white animate-pulse"
-                      : isDone
-                      ? "bg-emerald-500/20 text-emerald-400"
-                      : "bg-slate-800 text-slate-500"
-                  }`}
-                >
-                  {isFailed ? (
-                    <AlertCircle className="w-3.5 h-3.5 text-rose-400" />
-                  ) : isDone ? (
-                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                  ) : isCurrent ? (
-                    <Loader2 className="w-3.5 h-3.5 animate-spin text-white" />
-                  ) : (
-                    <Icon className="w-3.5 h-3.5" />
-                  )}
-                </div>
-
-                <div className="flex flex-col">
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-xs font-semibold tracking-tight">
-                      {stage.title}
-                    </span>
-                    {durationStr && (
-                      <span
-                        className={`text-[10px] font-mono px-1.5 py-0.2 rounded-md font-medium ${
-                          isDone
-                            ? "bg-emerald-500/20 text-emerald-300"
-                            : isCurrent
-                            ? "bg-blue-500/30 text-blue-200 animate-pulse"
-                            : "bg-slate-800 text-slate-400"
-                        }`}
-                      >
-                        {durationStr}
-                      </span>
-                    )}
-                  </div>
-                  <span className="text-[10px] text-slate-400/80 leading-none">
-                    {stage.desc}
-                  </span>
-                </div>
+                {isFailed ? (
+                  <AlertCircle className="w-3 h-3 text-neutral-300" />
+                ) : isDone ? (
+                  <Check className="w-3 h-3 text-neutral-300" />
+                ) : isCurrent ? (
+                  <Loader2 className="w-3 h-3 animate-spin text-black" />
+                ) : (
+                  <Icon className="w-3 h-3 text-neutral-500" />
+                )}
               </div>
 
-              {idx < STAGES.length - 1 && (
-                <div
-                  className={`flex-1 h-[2px] min-w-4 max-w-10 transition-colors ${
-                    stage.id < currentStage
-                      ? "bg-emerald-500/60 shadow-sm shadow-emerald-500/40"
-                      : stage.id === currentStage
-                      ? "bg-gradient-to-r from-blue-500 to-slate-800 animate-pulse"
-                      : "bg-slate-800/80"
-                  }`}
-                />
-              )}
-            </React.Fragment>
+              <div className="flex flex-col min-w-0">
+                <div className="flex items-center gap-1.5">
+                  <span className="truncate">{stage.title}</span>
+                  {durationStr && (
+                    <span className="text-[10px] font-mono px-1 rounded bg-neutral-800 text-neutral-400">
+                      {durationStr}
+                    </span>
+                  )}
+                </div>
+                <span className="text-[10px] text-neutral-500 truncate leading-tight">
+                  {stage.desc}
+                </span>
+              </div>
+            </div>
           );
         })}
       </div>
