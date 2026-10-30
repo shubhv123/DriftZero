@@ -456,6 +456,9 @@ def _run_local_process_sandbox(
         (cache_key in _LOCAL_VENV_CACHE and venv_python.exists())
         or (ready_marker.exists() and venv_python.is_file() and os.access(venv_python, os.X_OK))
     )
+    pins_relaxed = False
+    if is_cached and (venv_path / "PINS_RELAXED").exists():
+        pins_relaxed = True
 
     if not is_cached:
         if venv_path.exists() and not ready_marker.exists():
@@ -577,31 +580,40 @@ def _run_local_process_sandbox(
                                 relaxed_lines.append(line)
                                 continue
                             pkg_name = re.split(r"[=<>]", stripped)[0].strip().lower()
-                            if pkg_name in ("pydantic", "pydantic-core", "fastapi"):
+                            if "==" in line:
                                 print(f"  ⚠️ [Sandbox] Exact pin '{stripped}' failed to install; relaxing to '>=' (baseline/patched may no longer differ only by the migration)", flush=True)
-                                relaxed_lines.append(line.replace("==", ">="))
+                                relaxed_line = line.replace("==", ">=")
+                                if relaxed_line != line:
+                                    pins_relaxed = True
+                                relaxed_lines.append(relaxed_line)
                             else:
                                 relaxed_lines.append(line)
-                        with tempfile.NamedTemporaryFile("w", suffix="_relaxed_reqs.txt", delete=False) as rf:
-                            rf.write("\n".join(relaxed_lines) + "\n")
-                            temp_rf_path = rf.name
-                        deps_inst = subprocess.run(
-                            [str(venv_pip), "install", "--no-cache-dir", "-r", temp_rf_path],
-                            capture_output=True,
-                            text=True,
-                            timeout=120,
-                            env=scrubbed_env,
-                        )
-                        try:
-                            os.unlink(temp_rf_path)
-                        except Exception:
-                            pass
+                        if pins_relaxed:
+                            with tempfile.NamedTemporaryFile("w", suffix="_relaxed_reqs.txt", delete=False) as rf:
+                                rf.write("\n".join(relaxed_lines) + "\n")
+                                temp_rf_path = rf.name
+                            deps_inst = subprocess.run(
+                                [str(venv_pip), "install", "--no-cache-dir", "-r", temp_rf_path],
+                                capture_output=True,
+                                text=True,
+                                timeout=120,
+                                env=scrubbed_env,
+                            )
+                            try:
+                                os.unlink(temp_rf_path)
+                            except Exception:
+                                pass
                     except Exception:
                         pass
 
                 if deps_inst.returncode != 0:
                     duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
                     manifest_name = "requirements.txt" if req_file.exists() else "pyproject.toml"
+                    stdout_log = deps_inst.stdout or ""
+                    if pins_relaxed:
+                        if stdout_log and not stdout_log.endswith("\n"):
+                            stdout_log += "\n"
+                        stdout_log += "PINS RELAXED\n"
                     return SandboxRunAttempt(
                         attempt_number=attempt_num,
                         job_id=job_id,
@@ -610,14 +622,18 @@ def _run_local_process_sandbox(
                         passed_count=0,
                         failed_count=1,
                         duration_ms=duration_ms,
-                        stdout_log=deps_inst.stdout,
+                        stdout_log=stdout_log,
                         stderr_traceback=(
                             f"Failed to pip-install {target_label} dependencies from {manifest_name} into venv:\n"
                             f"{deps_inst.stderr}"
                         ).strip(),
+                        pins_relaxed=pins_relaxed,
                     )
             except Exception as exc:
                 duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+                stdout_log = ""
+                if pins_relaxed:
+                    stdout_log = "PINS RELAXED\n"
                 return SandboxRunAttempt(
                     attempt_number=attempt_num,
                     job_id=job_id,
@@ -626,17 +642,22 @@ def _run_local_process_sandbox(
                     passed_count=0,
                     failed_count=1,
                     duration_ms=duration_ms,
-                    stdout_log="",
+                    stdout_log=stdout_log,
                     stderr_traceback=f"Exception installing {target_label} dependencies into venv: {exc}",
+                    pins_relaxed=pins_relaxed,
                 )
 
         try:
+            if pins_relaxed:
+                (venv_path / "PINS_RELAXED").write_text("1", encoding="utf-8")
             ready_marker.write_text("ready", encoding="utf-8")
         except Exception:
             pass
         _LOCAL_VENV_CACHE[cache_key] = venv_path
     else:
         _LOCAL_VENV_CACHE[cache_key] = venv_path
+        if (venv_path / "PINS_RELAXED").exists():
+            pins_relaxed = True
 
     # 3. Run pytest with that venv's python
     cmd = [str(venv_python), "-m", "pytest", "test_migration_parity.py", "-v", "--tb=short"]
@@ -660,6 +681,12 @@ def _run_local_process_sandbox(
         elif proc.returncode != 0 and proc.stdout:
             traceback_excerpt = proc.stdout
 
+        stdout_log = f"[{target_label} Process Sandbox - LOCAL RUNNER (venv: {venv_path.name})]\n{proc.stdout}"
+        if pins_relaxed:
+            if stdout_log and not stdout_log.endswith("\n"):
+                stdout_log += "\n"
+            stdout_log += "PINS RELAXED\n"
+
         return SandboxRunAttempt(
             attempt_number=attempt_num,
             job_id=job_id,
@@ -668,13 +695,19 @@ def _run_local_process_sandbox(
             passed_count=passed,
             failed_count=failed,
             duration_ms=duration_ms,
-            stdout_log=f"[{target_label} Process Sandbox - LOCAL RUNNER (venv: {venv_path.name})]\n{proc.stdout}",
+            stdout_log=stdout_log,
             stderr_traceback=traceback_excerpt.strip(),
+            pins_relaxed=pins_relaxed,
         )
     except subprocess.TimeoutExpired as exc:
         duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
         out = exc.stdout or ""
         err = exc.stderr or ""
+        stdout_log = out if isinstance(out, str) else out.decode("utf-8", errors="replace")
+        if pins_relaxed:
+            if stdout_log and not stdout_log.endswith("\n"):
+                stdout_log += "\n"
+            stdout_log += "PINS RELAXED\n"
         return SandboxRunAttempt(
             attempt_number=attempt_num,
             job_id=job_id,
@@ -683,11 +716,15 @@ def _run_local_process_sandbox(
             passed_count=0,
             failed_count=1,
             duration_ms=duration_ms,
-            stdout_log=out if isinstance(out, str) else out.decode("utf-8", errors="replace"),
+            stdout_log=stdout_log,
             stderr_traceback=f"Execution timed out after {timeout} seconds: Process exceeded execution deadline.\n{err}".strip(),
+            pins_relaxed=pins_relaxed,
         )
     except Exception as exc:
         duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        stdout_log = ""
+        if pins_relaxed:
+            stdout_log = "PINS RELAXED\n"
         return SandboxRunAttempt(
             attempt_number=attempt_num,
             job_id=job_id,
@@ -696,8 +733,9 @@ def _run_local_process_sandbox(
             passed_count=0,
             failed_count=1,
             duration_ms=duration_ms,
-            stdout_log="",
+            stdout_log=stdout_log,
             stderr_traceback=f"Local sandbox execution failed with error: {exc}",
+            pins_relaxed=pins_relaxed,
         )
 
 
@@ -803,13 +841,15 @@ def execute_stage4_verification_loop(
         # Record baseline outputs into golden.json using the old-version container
         try:
             print("  ✨ [Differential Parity] Recording baseline outputs into golden.json via old-version container...", flush=True)
-            run_single_sandbox_job(
+            baseline_rec = run_single_sandbox_job(
                 baseline_repo_dir,
                 0,
                 target_label="BASELINE_RECORD",
                 timeout=45,
                 extra_env={"DRIFTZERO_RECORD_GOLDEN": "1"},
             )
+            if baseline_rec and (getattr(baseline_rec, "pins_relaxed", False) or "PINS RELAXED" in getattr(baseline_rec, "stdout_log", "")):
+                pins_relaxed_overall = True
             golden_src = baseline_repo_dir / "golden.json"
             if golden_src.exists():
                 shutil.copy2(golden_src, patched_repo_dir / "golden.json")
@@ -819,12 +859,18 @@ def execute_stage4_verification_loop(
 
     attempts: List[SandboxRunAttempt] = []
     self_healed = False
+    pins_relaxed_overall = False
 
     for attempt_idx in range(1, max_retries + 1):
         # Run baseline and patched code in two containers in parallel
         baseline_res, attempt_result = run_baseline_and_patched_parallel(
             baseline_repo_dir, patched_repo_dir, attempt_idx
         )
+
+        if baseline_res and (getattr(baseline_res, "pins_relaxed", False) or "PINS RELAXED" in getattr(baseline_res, "stdout_log", "")):
+            pins_relaxed_overall = True
+        if getattr(attempt_result, "pins_relaxed", False) or "PINS RELAXED" in getattr(attempt_result, "stdout_log", ""):
+            pins_relaxed_overall = True
 
         # Attach differential summary to the patched result stdout
         if baseline_res:
@@ -863,7 +909,9 @@ def execute_stage4_verification_loop(
 
         attempts.append(attempt_result)
 
-    final_status = "PASSED" if attempts and attempts[-1].exit_code == 0 else "FAILED"
+    final_status = "FAILED"
+    if attempts and attempts[-1].exit_code == 0:
+        final_status = "NEEDS_MANUAL" if pins_relaxed_overall else "PASSED"
 
     return Stage4VerificationReport(
         test_file_path=str(test_file),
@@ -871,4 +919,5 @@ def execute_stage4_verification_loop(
         final_status=final_status,
         self_healing_triggered=self_healed,
         attempts=attempts,
+        pins_relaxed=pins_relaxed_overall,
     )

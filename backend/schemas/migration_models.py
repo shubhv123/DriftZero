@@ -135,15 +135,17 @@ class SandboxRunAttempt:
     stderr_traceback: str
     healed_file: Optional[str] = None
     healed_by_model: Optional[str] = None
+    pins_relaxed: bool = False
 
 
 @dataclass
 class Stage4VerificationReport:
     test_file_path: str
     total_attempts: int
-    final_status: str  # "PASSED" or "FAILED"
+    final_status: str  # "PASSED", "FAILED", or "NEEDS_MANUAL"
     self_healing_triggered: bool
     attempts: List[SandboxRunAttempt] = field(default_factory=list)
+    pins_relaxed: bool = False
 
     def to_dict(self) -> Dict:
         return asdict(self)

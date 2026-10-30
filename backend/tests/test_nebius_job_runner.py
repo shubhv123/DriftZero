@@ -12,8 +12,10 @@ from backend.verification.nebius_job_runner import (
     _reset_local_venv_cache_for_testing,
     _run_docker_container,
     _run_local_process_sandbox,
+    execute_stage4_verification_loop,
     run_single_sandbox_job,
 )
+from backend.schemas.migration_models import MigrationDelta, SandboxRunAttempt
 
 
 def test_is_docker_daemon_reachable():
@@ -310,3 +312,103 @@ def test_entrypoint_sh_contents():
     # Must handle /out volume and golden.json
     assert "/out" in content
     assert "golden.json" in content
+
+
+def test_relax_pins_sets_flag_and_stdout_log(monkeypatch):
+    """Verify that when exact pins fail to install and are relaxed to '>=', pins_relaxed is True and 'PINS RELAXED' is appended to stdout_log."""
+    monkeypatch.setenv("ALLOW_UNSAFE_LOCAL_SANDBOX", "1")
+    _reset_local_venv_cache_for_testing()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = Path(tmpdir) / "repo"
+        repo_dir.mkdir()
+        (repo_dir / "requirements.txt").write_text("pydantic==1.10.12\n", encoding="utf-8")
+        (repo_dir / "test_migration_parity.py").write_text("def test_dummy(): pass\n", encoding="utf-8")
+
+        pip_attempts = []
+
+        def mock_subprocess_run(cmd, *args, **kwargs):
+            if "-m" in cmd and "venv" in cmd:
+                venv_dir = Path(cmd[-1])
+                bin_dir = venv_dir / "bin"
+                bin_dir.mkdir(parents=True, exist_ok=True)
+                (bin_dir / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+                (bin_dir / "pip").write_text("#!/bin/sh\n", encoding="utf-8")
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+            elif "pip" in cmd[0] and "install" in cmd and "pytest>=8.0.0" in cmd:
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Installed pytest", stderr="")
+            elif "pip" in cmd[0] and "install" in cmd and "-r" in cmd:
+                pip_attempts.append(cmd[-1])
+                if len(pip_attempts) == 1:
+                    # First install attempt with exact pin fails (e.g. no pre-built wheel)
+                    return subprocess.CompletedProcess(
+                        args=cmd,
+                        returncode=1,
+                        stdout="",
+                        stderr="ERROR: Failed building wheel for pydantic==1.10.12",
+                    )
+                # Second install attempt with relaxed pin succeeds
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Successfully installed pydantic>=1.10.12", stderr="")
+            elif "python" in cmd[0] and "-m" in cmd and "pytest" in cmd:
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="1 passed in 0.05s\n", stderr="")
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        with patch("subprocess.run", side_effect=mock_subprocess_run):
+            res = _run_local_process_sandbox(repo_dir, "job-relaxed", 1, "PATCHED", 30)
+            assert res.exit_code == 0
+            assert res.passed_count == 1
+            assert res.pins_relaxed is True
+            assert "PINS RELAXED" in res.stdout_log
+            assert "PINS RELAXED" in res.stdout_log.splitlines()
+            assert len(pip_attempts) == 2
+
+
+def test_stage4_passes_with_relaxed_pins_sets_needs_manual():
+    """Verify that if the parity run passes with relaxed pins, final_status is set to NEEDS_MANUAL instead of PASSED."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = Path(tmpdir) / "patched_repo"
+        repo_dir.mkdir()
+        (repo_dir / "test_migration_parity.py").write_text("def test_ok(): pass\n")
+
+        dummy_delta = MagicMock(spec=MigrationDelta)
+
+        # Case 1: Parity passes (exit_code=0) but pins were relaxed -> NEEDS_MANUAL
+        relaxed_attempt = SandboxRunAttempt(
+            attempt_number=1,
+            job_id="job-relaxed-1",
+            execution_target="LOCAL_SANDBOX_RUNNER",
+            exit_code=0,
+            passed_count=2,
+            failed_count=0,
+            duration_ms=50.0,
+            stdout_log="[PATCHED]\n2 passed in 0.05s\nPINS RELAXED\n",
+            stderr_traceback="",
+            pins_relaxed=True,
+        )
+
+        with patch("backend.verification.nebius_job_runner.generate_parity_test_suite", return_value=repo_dir / "test_migration_parity.py"), \
+             patch("backend.verification.nebius_job_runner.run_baseline_and_patched_parallel", return_value=(None, relaxed_attempt)):
+            report = execute_stage4_verification_loop(repo_dir, dummy_delta, max_retries=1)
+            assert report.final_status == "NEEDS_MANUAL"
+            assert report.pins_relaxed is True
+
+        # Case 2: Parity passes (exit_code=0) without relaxed pins -> PASSED
+        normal_attempt = SandboxRunAttempt(
+            attempt_number=1,
+            job_id="job-normal-1",
+            execution_target="LOCAL_SANDBOX_RUNNER",
+            exit_code=0,
+            passed_count=2,
+            failed_count=0,
+            duration_ms=50.0,
+            stdout_log="[PATCHED]\n2 passed in 0.05s\n",
+            stderr_traceback="",
+            pins_relaxed=False,
+        )
+
+        with patch("backend.verification.nebius_job_runner.generate_parity_test_suite", return_value=repo_dir / "test_migration_parity.py"), \
+             patch("backend.verification.nebius_job_runner.run_baseline_and_patched_parallel", return_value=(None, normal_attempt)):
+            report2 = execute_stage4_verification_loop(repo_dir, dummy_delta, max_retries=1)
+            assert report2.final_status == "PASSED"
+            assert report2.pins_relaxed is False
+
