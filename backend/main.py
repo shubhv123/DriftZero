@@ -231,6 +231,25 @@ def health_check():
     }
 
 
+async def _execute_with_heartbeats(func, *args, interval: float = 15.0):
+    """
+    Runs a blocking function via asyncio.to_thread while yielding periodic SSE heartbeat pings
+    every `interval` seconds so long-running operations never trigger proxy timeouts.
+    Yields (False, ": ping\\n\\n") periodically, and finally (True, result).
+    """
+    task = asyncio.create_task(asyncio.to_thread(func, *args))
+    while True:
+        try:
+            res = await asyncio.wait_for(asyncio.shield(task), timeout=interval)
+            yield (True, res)
+            return
+        except asyncio.TimeoutError:
+            if task.done():
+                yield (True, task.result())
+                return
+            yield (False, ": ping\n\n")
+
+
 async def _run_event_stream_pipeline(
     repo_url: str,
     target_library: Optional[str] = None,
@@ -310,13 +329,17 @@ async def _run_event_stream_pipeline(
         # STAGE 2: Tavily Live Delta Engine
         yield _sse_pack("stage_start", {"stage": 2, "title": "Tavily Live Documentation Delta"})
 
-        # Call execute_stage2_and_stage3_pipeline's parallel patch path instead of the sequential loop
-        migration_delta, s3_report = await asyncio.to_thread(
+        # Call execute_stage2_and_stage3_pipeline's parallel patch path with keep-alive heartbeats
+        async for is_done, payload in _execute_with_heartbeats(
             execute_stage2_and_stage3_pipeline,
             blast_report,
             patched_workspace,
             build_log,
-        )
+        ):
+            if is_done:
+                migration_delta, s3_report = payload
+            else:
+                yield payload
         yield _sse_pack("stage2_complete", migration_delta.to_dict())
         await asyncio.sleep(0.15)
 
@@ -349,11 +372,19 @@ async def _run_event_stream_pipeline(
         yield _sse_pack("stage3_complete", s3_report.to_dict())
         await asyncio.sleep(0.15)
 
-        # STAGE 4: Nebius Serverless Jobs Sandbox & Self-Healer
+        # STAGE 4: Nebius Serverless Jobs Sandbox & Self-Healer with keep-alive heartbeats
         yield _sse_pack("stage_start", {"stage": 4, "title": "Nebius Serverless Jobs Parity Sandbox"})
-        stage4_report = await asyncio.to_thread(
-            execute_stage4_verification_loop, patched_workspace, migration_delta, 3, workspace_path
-        )
+        async for is_done, payload in _execute_with_heartbeats(
+            execute_stage4_verification_loop,
+            patched_workspace,
+            migration_delta,
+            3,
+            workspace_path,
+        ):
+            if is_done:
+                stage4_report = payload
+            else:
+                yield payload
 
         # If any patch is FAILED, set final_status="FAILED" and open only a draft PR (or none)
         if any(p.status == "FAILED" for p in s3_report.patches):
@@ -380,7 +411,8 @@ async def _run_event_stream_pipeline(
         )
 
         # 2. Create migration PR (commits everything including living rules, pushes/forks, opens PR or Draft PR)
-        pr_url = await asyncio.to_thread(
+        pr_url = None
+        async for is_done, payload in _execute_with_heartbeats(
             create_migration_pr,
             patched_workspace,
             migration_delta,
@@ -388,7 +420,11 @@ async def _run_event_stream_pipeline(
             repo_url,
             github_token,
             skip_unverified_pr,
-        )
+        ):
+            if is_done:
+                pr_url = payload
+            else:
+                yield payload
         stage5_bundle.pr_url = pr_url
 
         yield _sse_pack("stage5_complete", stage5_bundle.to_dict())

@@ -8,6 +8,9 @@ import pytest
 
 from backend.verification.nebius_job_runner import (
     _compute_manifest_hash,
+    _discover_pythonpath_roots,
+    _extract_failing_files_from_traceback,
+    _find_workspace_manifests,
     _is_docker_daemon_reachable,
     _reset_local_venv_cache_for_testing,
     _run_docker_container,
@@ -15,6 +18,7 @@ from backend.verification.nebius_job_runner import (
     execute_stage4_verification_loop,
     run_single_sandbox_job,
 )
+from backend.verification.self_healer import _splice_ast_patch
 from backend.schemas.migration_models import MigrationDelta, SandboxRunAttempt
 
 
@@ -289,8 +293,8 @@ def test_local_process_sandbox_caches_venvs(monkeypatch):
             # Attempt 1: PATCHED
             res1 = _run_local_process_sandbox(repo_dir, "job-cache-1", 1, "PATCHED", 30)
             assert res1.exit_code == 0
-            # Attempt 1 should create venv, install pytest, install requirements, and run pytest (4 calls)
-            assert len(executed_cmds) == 4
+            # Attempt 1 should create venv, install pytest, install requirements, and run pytest (plus unshare check if available)
+            assert len(executed_cmds) in (4, 5)
             assert any("-m" in c and "venv" in c for c in executed_cmds)
 
             # Attempt 2: PATCHED with exact same manifest -> should reuse cached venv!
@@ -556,4 +560,206 @@ def test_network_isolation_fallback_when_unshare_unprivileged(monkeypatch):
             assert "unshare" not in cmd
             assert "pytest" in cmd
             assert "Network isolation unpermitted" in res.stdout_log
+
+
+def test_extract_failing_files_prioritizes_innermost_frame():
+    """Verify _extract_failing_files_from_traceback prioritizes the leaf/innermost failure frames."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = Path(tmpdir)
+        (repo_dir / "pkg").mkdir()
+        (repo_dir / "pkg" / "cli.py").write_text("def run(): pass\n", encoding="utf-8")
+        (repo_dir / "pkg" / "scanner.py").write_text("def execute(): pass\n", encoding="utf-8")
+        (repo_dir / "pkg" / "github.py").write_text("def fetch(): pass\n", encoding="utf-8")
+        (repo_dir / "pkg" / "rules.py").write_text("def load(): pass\n", encoding="utf-8")
+
+        traceback_text = """
+=================================== FAILURES ===================================
+__________________________________ test_scan ___________________________________
+
+    def test_scan():
+>       cli.run()
+
+pkg/cli.py:45: in run
+    scanner.execute()
+pkg/scanner.py:88: in execute
+    github.fetch()
+pkg/github.py:12: in fetch
+    raise AttributeError('deprecated method')
+E   AttributeError: deprecated method
+
+__________________________________ test_rules __________________________________
+
+    def test_rules():
+>       rules.load()
+
+pkg/rules.py:30: in load
+    raise ValueError('invalid regex')
+E   ValueError: invalid regex
+"""
+        extracted = _extract_failing_files_from_traceback(traceback_text, repo_dir)
+        # Should prioritize innermost frames: github.py and rules.py first, rather than outer cli.py
+        assert extracted == ["pkg/github.py", "pkg/rules.py"]
+
+
+def test_splice_ast_patch_partial_class_replacement():
+    """Verify _splice_ast_patch replaces a modified class while preserving untouched sibling classes."""
+    original = """import os
+
+class UnchangedConfig:
+    timeout = 30
+
+class FailingScanner:
+    def scan(self):
+        return "broken"
+
+class UnchangedRules:
+    def check(self):
+        return True
+"""
+    candidate = """class FailingScanner:
+    def scan(self):
+        return "healed"
+"""
+    spliced = _splice_ast_patch(original, candidate)
+    assert spliced
+    assert 'return "healed"' in spliced
+    assert "class UnchangedConfig:" in spliced
+    assert "class UnchangedRules:" in spliced
+    assert "timeout = 30" in spliced
+
+
+def test_splice_ast_patch_decorators_and_imports():
+    """Verify _splice_ast_patch preserves decorators and correctly integrates new imports."""
+    original = """import os
+
+@deprecated
+class LegacyWorker:
+    def work(self):
+        pass
+"""
+    candidate = """import sys
+import json
+
+@modern
+class LegacyWorker:
+    def work(self):
+        return "done"
+"""
+    spliced = _splice_ast_patch(original, candidate)
+    assert spliced
+    assert "@modern" in spliced
+    assert 'return "done"' in spliced
+    assert "import sys" in spliced
+    assert "import json" in spliced
+
+
+def test_splice_ast_patch_rejects_malformed_code():
+    """Verify _splice_ast_patch rejects syntax errors or placeholder ellipses."""
+    original = "class A: pass\n"
+    # Case 1: syntax error
+    assert _splice_ast_patch(original, "class A def broken:") == ""
+    # Case 2: placeholder ellipsis
+    assert _splice_ast_patch(original, "class A:\n    ...\n") == ""
+    # Case 3: empty candidate
+    assert _splice_ast_patch(original, "") == ""
+
+
+def test_find_workspace_manifests_detects_backend_dir():
+    """Verify _find_workspace_manifests detects both root and subdirectory manifests (e.g. backend/requirements.txt)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "requirements.txt").write_text("pydantic==2.9.2\n", encoding="utf-8")
+        (root / "backend").mkdir()
+        (root / "backend" / "requirements.txt").write_text("fastapi==0.110.0\n", encoding="utf-8")
+        (root / ".venv").mkdir()
+        (root / ".venv" / "requirements.txt").write_text("ignored==1.0\n", encoding="utf-8")
+
+        manifests = _find_workspace_manifests(root)
+        names = [str(m.relative_to(root)) for m in manifests]
+        assert "requirements.txt" in names
+        assert "backend/requirements.txt" in names
+        assert not any(".venv" in n for n in names)
+
+
+def test_discover_pythonpath_roots_includes_backend_and_src():
+    """Verify _discover_pythonpath_roots appends src/ and backend/ directories containing python modules."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "src").mkdir()
+        (root / "backend").mkdir()
+        (root / "backend" / "app").mkdir()
+        (root / "backend" / "app" / "__init__.py").write_text("", encoding="utf-8")
+        (root / "node_modules").mkdir()
+
+        roots = _discover_pythonpath_roots(root)
+        assert str(root) in roots
+        assert str(root / "src") in roots
+        assert str(root / "backend") in roots
+        assert "node_modules" not in roots
+
+
+def test_manifest_hash_changes_when_nested_manifest_modified():
+    """Verify that _compute_manifest_hash takes nested manifests (e.g. backend/requirements.txt) into account."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "backend").mkdir()
+        req_file = root / "backend" / "requirements.txt"
+        req_file.write_text("fastapi==0.110.0\n", encoding="utf-8")
+
+        h1 = _compute_manifest_hash(root)
+        assert h1 != "baec4b29b83ac606"  # Must NOT be 'no-manifest'
+
+        req_file.write_text("fastapi==0.111.0\n", encoding="utf-8")
+        h2 = _compute_manifest_hash(root)
+        assert h1 != h2
+
+
+def test_resilient_pip_install_installs_surviving_dependencies(monkeypatch):
+    """Verify that when one package pin fails in requirements.txt, resilient per-line fallback installs surviving packages."""
+    monkeypatch.setenv("ALLOW_UNSAFE_LOCAL_SANDBOX", "1")
+    _reset_local_venv_cache_for_testing()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = Path(tmpdir) / "repo"
+        repo_dir.mkdir()
+        (repo_dir / "requirements.txt").write_text(
+            "valid-pkg==1.0\n"
+            "incompatible-pkg==9.9.9\n",
+            encoding="utf-8",
+        )
+        (repo_dir / "test_migration_parity.py").write_text("def test_dummy(): pass\n", encoding="utf-8")
+
+        installed_pkgs = []
+
+        def mock_subprocess_run(cmd, *args, **kwargs):
+            if "-m" in cmd and "venv" in cmd:
+                venv_dir = Path(cmd[-1])
+                bin_dir = venv_dir / "bin"
+                bin_dir.mkdir(parents=True, exist_ok=True)
+                (bin_dir / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+                (bin_dir / "pip").write_text("#!/bin/sh\n", encoding="utf-8")
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+            elif "pip" in cmd[0] and "install" in cmd and "pytest>=8.0.0" in cmd:
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Installed pytest", stderr="")
+            elif "pip" in cmd[0] and "install" in cmd and "-r" in cmd:
+                # Batch install fails due to incompatible-pkg
+                return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="ERROR: incompatible-pkg not found")
+            elif "pip" in cmd[0] and "install" in cmd and "--prefer-binary" in cmd:
+                pkg_arg = cmd[-1]
+                if "incompatible-pkg" in pkg_arg:
+                    return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="ERROR: incompatible-pkg not found")
+                installed_pkgs.append(pkg_arg)
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=f"Successfully installed {pkg_arg}", stderr="")
+            elif any("python" in arg for arg in cmd) and "-m" in cmd and "pytest" in cmd:
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="1 passed in 0.05s\n", stderr="")
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        with patch("subprocess.run", side_effect=mock_subprocess_run):
+            res = _run_local_process_sandbox(repo_dir, "job-resilient", 1, "PATCHED", 30)
+            assert res.exit_code == 0
+            assert res.passed_count == 1
+            assert any("valid-pkg" in p for p in installed_pkgs)
+            assert res.pins_relaxed is True
+
+
 

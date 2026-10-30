@@ -258,3 +258,26 @@ def test_placeholder_api_key_rejected_at_startup(monkeypatch):
     with pytest.raises(RuntimeError):
         with TestClient(m.app):
             pass
+
+
+@pytest.mark.anyio
+async def test_execute_with_heartbeats_yields_ping_on_delay():
+    import time
+    from backend.main import _execute_with_heartbeats
+
+    def slow_worker(val: int):
+        time.sleep(0.08)
+        return val * 2
+
+    chunks = []
+    async for is_final, payload in _execute_with_heartbeats(slow_worker, 21, interval=0.02):
+        chunks.append((is_final, payload))
+
+    pings = [p for is_final, p in chunks if not is_final]
+    finals = [p for is_final, p in chunks if is_final]
+
+    assert len(pings) >= 1
+    assert ": ping\n\n" in pings
+    assert len(finals) == 1
+    assert finals[0] == 42
+

@@ -14,6 +14,13 @@ if [ -d "/out" ] && [ -f "/out/golden.json" ] && [ ! -f "golden.json" ]; then
     cp /out/golden.json ./golden.json
 fi
 
+# Dynamically add repository subdirectories (like src, backend, app) to PYTHONPATH if present
+EXTRA_PP="."
+[ -d "./src" ] && EXTRA_PP="${EXTRA_PP}:./src"
+[ -d "./backend" ] && EXTRA_PP="${EXTRA_PP}:./backend"
+[ -d "./app" ] && EXTRA_PP="${EXTRA_PP}:./app"
+export PYTHONPATH="${EXTRA_PP}${PYTHONPATH:+:${PYTHONPATH}}"
+
 # Run test suite
 RET=0
 if [ $# -gt 0 ]; then

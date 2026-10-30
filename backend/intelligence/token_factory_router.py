@@ -77,6 +77,98 @@ def _is_valid_complete_replacement(candidate: str, original: str) -> bool:
         return False
 
 
+def _get_node_start_lineno(node: ast.AST) -> int:
+    """Returns the line number where a node begins, including preceding decorators."""
+    if hasattr(node, "decorator_list") and node.decorator_list:
+        return node.decorator_list[0].lineno
+    return node.lineno
+
+
+def _splice_ast_patch(original: str, candidate: str) -> str:
+    """
+    Surgically splices candidate classes/functions into the original file if the candidate
+    is a partial patch (e.g. only contains the fixed class/function) rather than a full rewrite.
+    Preserves all original untouched classes, functions, comments, and docstrings.
+    """
+    try:
+        if not candidate or ("..." in candidate and "..." not in original):
+            return ""
+        orig_tree = ast.parse(original)
+        cand_tree = ast.parse(candidate)
+
+        orig_lines = original.splitlines(keepends=True)
+        cand_lines = candidate.splitlines(keepends=True)
+
+        cand_defs = {}
+        cand_imports = []
+        for node in cand_tree.body:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                cand_defs[node.name] = node
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                cand_imports.append(node)
+
+        if not cand_defs:
+            return ""
+
+        replacements = []
+        orig_def_names = set()
+        for node in orig_tree.body:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                orig_def_names.add(node.name)
+                if node.name in cand_defs:
+                    cand_node = cand_defs[node.name]
+                    cand_start = _get_node_start_lineno(cand_node) - 1
+                    cand_end = cand_node.end_lineno
+                    cand_text = "".join(cand_lines[cand_start:cand_end]).rstrip() + "\n"
+
+                    orig_start = _get_node_start_lineno(node) - 1
+                    orig_end = node.end_lineno
+                    replacements.append((orig_start, orig_end, cand_text))
+
+        if not replacements:
+            return ""
+
+        # Apply replacements from bottom to top so line number offsets remain invariant
+        replacements.sort(key=lambda x: x[0], reverse=True)
+        result_lines = list(orig_lines)
+        for start, end, new_text in replacements:
+            result_lines[start:end] = [new_text]
+
+        # Integrate any new top-level classes/functions introduced in candidate
+        new_defs = [
+            node for name, node in cand_defs.items()
+            if name not in orig_def_names
+        ]
+        for new_node in new_defs:
+            new_start = _get_node_start_lineno(new_node) - 1
+            new_end = new_node.end_lineno
+            new_text = "\n\n" + "".join(cand_lines[new_start:new_end]).rstrip() + "\n"
+            result_lines.append(new_text)
+
+        # Integrate any new imports from candidate not already in original
+        existing_code = "".join(result_lines)
+        new_import_lines = []
+        for imp_node in cand_imports:
+            imp_start = _get_node_start_lineno(imp_node) - 1
+            imp_end = imp_node.end_lineno
+            imp_text = "".join(cand_lines[imp_start:imp_end]).strip()
+            if imp_text and imp_text not in existing_code:
+                new_import_lines.append(imp_text + "\n")
+
+        if new_import_lines:
+            last_import_line = 0
+            for node in orig_tree.body:
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    last_import_line = max(last_import_line, node.end_lineno)
+            result_lines.insert(last_import_line, "".join(new_import_lines))
+
+        spliced = "".join(result_lines)
+        ast.parse(spliced)
+        return spliced
+    except Exception:
+        return ""
+
+
 def _filter_rules_for_file(
     file_report: AffectedFileReport,
     migration_delta: MigrationDelta,
@@ -494,12 +586,13 @@ def patch_single_file_via_token_factory(
             },
         ]
 
-        print(f"  🌐 [LIVE NEBIUS TOKEN FACTORY] Patching {file_report.relative_path} via {model_id} ({len(relevant_rules)} rules)...", flush=True)
+        calc_max_tokens = 8192 if (is_ultra or len(original_code.splitlines()) > 120) else 4000
+        print(f"  🌐 [LIVE NEBIUS TOKEN FACTORY] Patching {file_report.relative_path} via {model_id} ({len(relevant_rules)} rules, max_tokens={calc_max_tokens})...", flush=True)
         response = client.chat.completions.create(
             model=model_id,
             messages=messages,
             temperature=0.05,
-            max_tokens=4000,
+            max_tokens=calc_max_tokens,
         )
 
         if response.usage:
@@ -524,6 +617,23 @@ def patch_single_file_via_token_factory(
             relevant_rules,
             file_path=file_report.file_path,
         )
+
+        # If candidate is missing original classes or functions, attempt surgical AST grafting
+        if not is_valid and ("missing original classes" in (validation_error or "") or "missing original functions" in (validation_error or "")):
+            spliced = _splice_ast_patch(original_code, candidate_code)
+            if spliced:
+                spliced_valid, spliced_error = _validate_patch(
+                    spliced,
+                    original_code,
+                    migration_delta.library,
+                    relevant_rules,
+                    file_path=file_report.file_path,
+                )
+                if spliced_valid:
+                    candidate_code = spliced
+                    is_valid = True
+                    validation_error = None
+                    print(f"  🔧 [AST Graft] Surgically preserved original classes/functions in {file_report.relative_path}", flush=True)
 
         if is_valid:
             patched_code = candidate_code
@@ -560,7 +670,7 @@ def patch_single_file_via_token_factory(
                 model=model_id,
                 messages=messages,
                 temperature=0.05,
-                max_tokens=4000,
+                max_tokens=8192,
             )
             if retry_response.usage:
                 prompt_tokens += retry_response.usage.prompt_tokens
@@ -584,6 +694,23 @@ def patch_single_file_via_token_factory(
                 relevant_rules,
                 file_path=file_report.file_path,
             )
+
+            # If retry candidate is missing original classes or functions, attempt surgical AST grafting
+            if not retry_is_valid and ("missing original classes" in (retry_error or "") or "missing original functions" in (retry_error or "")):
+                spliced_retry = _splice_ast_patch(original_code, retry_candidate)
+                if spliced_retry:
+                    spliced_valid, spliced_err = _validate_patch(
+                        spliced_retry,
+                        original_code,
+                        migration_delta.library,
+                        relevant_rules,
+                        file_path=file_report.file_path,
+                    )
+                    if spliced_valid:
+                        retry_candidate = spliced_retry
+                        retry_is_valid = True
+                        retry_error = None
+                        print(f"  🔧 [AST Graft] Surgically preserved original classes/functions on retry for {file_report.relative_path}", flush=True)
 
             if retry_is_valid:
                 patched_code = retry_candidate

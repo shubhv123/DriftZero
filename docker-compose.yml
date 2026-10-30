@@ -11,6 +11,8 @@ services:
     container_name: driftzero-backend
     expose:
       - "8000"
+    volumes:
+      - ./backend:/app/backend
     environment:
       - NEBIUS_API_KEY=${NEBIUS_API_KEY:-}
       - TAVILY_API_KEY=${TAVILY_API_KEY:-}

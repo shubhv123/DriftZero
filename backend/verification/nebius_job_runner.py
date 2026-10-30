@@ -37,6 +37,7 @@ def _parse_pytest_counts(stdout_text: str) -> Tuple[int, int]:
 def _extract_failing_files_from_traceback(traceback_text: str, patched_repo_dir: Path) -> List[str]:
     """
     Universally inspects the pytest traceback FAILURES or ERRORS section to identify failing source files.
+    Prioritizes innermost (root-cause) frames per failure section before outer intermediate callers.
     Works for direct stack frames as well as assertion failures inside test files.
     """
     target_text = traceback_text
@@ -49,24 +50,43 @@ def _extract_failing_files_from_traceback(traceback_text: str, patched_repo_dir:
     if "short test summary info" in target_text:
         target_text = target_text.split("short test summary info", 1)[0]
 
-    matches = re.findall(r"([\w\.\-/]+?\.py):\d+", target_text)
-    failing_files = []
-    for m in matches:
-        clean = m.replace("\\", "/")
-        p = Path(clean)
-        candidate = None
-        if not p.name.startswith("test_") and "site-packages" not in clean and ".venv" not in clean:
-            if not p.is_absolute() and (patched_repo_dir / clean).exists():
-                candidate = clean
-            elif p.is_absolute() and p.exists():
-                try:
-                    candidate = str(p.relative_to(patched_repo_dir))
-                except ValueError:
-                    pass
-        if candidate and candidate not in failing_files:
-            failing_files.append(candidate)
+    def _resolve_candidate(clean_path: str) -> Optional[str]:
+        p = Path(clean_path)
+        if p.name.startswith("test_") or "site-packages" in clean_path or ".venv" in clean_path:
+            return None
+        if not p.is_absolute() and (patched_repo_dir / clean_path).exists():
+            return clean_path
+        elif p.is_absolute() and p.exists():
+            try:
+                return str(p.relative_to(patched_repo_dir))
+            except ValueError:
+                return None
+        return None
 
-    # If no non-test file was in the traceback (e.g. assertion failed in test_*.py),
+    # Step 1: Split into individual test failure sections if present (e.g. "___ test_name ___")
+    sections = re.split(r"_{3,}\s+[\w\.\-\[\]]+\s+_{3,}", target_text)
+    failing_files = []
+
+    for section in sections:
+        matches = re.findall(r"([\w\.\-/]+?\.py):\d+", section)
+        # Scan in reverse order: the bottom-most frame in each section is the leaf / exception site
+        for m in reversed(matches):
+            clean = m.replace("\\", "/")
+            candidate = _resolve_candidate(clean)
+            if candidate and candidate not in failing_files:
+                failing_files.append(candidate)
+                break  # Pick the innermost root-cause frame for this test failure
+
+    # Step 2: Fallback across whole target_text if section splitting yielded nothing
+    if not failing_files:
+        matches = re.findall(r"([\w\.\-/]+?\.py):\d+", target_text)
+        for m in reversed(matches):
+            clean = m.replace("\\", "/")
+            candidate = _resolve_candidate(clean)
+            if candidate and candidate not in failing_files:
+                failing_files.append(candidate)
+
+    # Step 3: If no non-test file was in the traceback (e.g. assertion failed inside test_*.py),
     # universally index AST symbols across repo files to find which source file was being tested.
     if not failing_files:
         symbol_map = {}
@@ -340,31 +360,95 @@ def _run_docker_container(
         subprocess.run([docker_bin, "rmi", "-f", image_tag], capture_output=True)
 
 
+def _find_workspace_manifests(repo_dir: Path) -> List[Path]:
+    """
+    Universally finds requirements.txt, pyproject.toml, and setup.py manifests
+    across the repo root and primary subdirectories (e.g. backend/, api/, server/).
+    """
+    manifests: List[Path] = []
+    # 1. Root manifests
+    for name in ("requirements.txt", "pyproject.toml", "setup.py", "setup.cfg", "Pipfile"):
+        root_cand = repo_dir / name
+        if root_cand.is_file():
+            manifests.append(root_cand)
+
+    # 2. Primary subdirectory manifests (e.g. backend/requirements.txt, server/requirements.txt)
+    ignore_subs = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".tox", "tests"}
+    if repo_dir.exists():
+        try:
+            for sub in sorted(repo_dir.iterdir()):
+                if sub.is_dir() and sub.name not in ignore_subs and not sub.name.startswith("."):
+                    for name in ("requirements.txt", "pyproject.toml", "setup.py"):
+                        cand = sub / name
+                        if cand.is_file() and cand not in manifests:
+                            manifests.append(cand)
+        except Exception:
+            pass
+
+    return manifests
+
+
+def _discover_pythonpath_roots(repo_dir: Path) -> str:
+    """
+    Discovers all candidate Python source roots to guarantee internal package imports resolve.
+    Includes repo root, src/, and top-level subdirectories containing Python modules or packages
+    (e.g. backend/, api/, server/, app/).
+    """
+    roots = [str(repo_dir)]
+    src_dir = repo_dir / "src"
+    if src_dir.is_dir():
+        roots.append(str(src_dir))
+
+    sep = ";" if os.name == "nt" else ":"
+    ignore_dirs = {
+        ".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".tox", "tests"
+    }
+    if repo_dir.exists():
+        try:
+            for child in sorted(repo_dir.iterdir()):
+                if child.is_dir() and child.name not in ignore_dirs and not child.name.startswith("."):
+                    try:
+                        has_py = (
+                            (child / "__init__.py").exists()
+                            or any(child.glob("*.py"))
+                            or any((child / p).is_dir() for p in ("app", "core", "services", "models", "routers", "api", "src"))
+                        )
+                        if has_py and str(child) not in roots:
+                            roots.append(str(child))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    clean_pythonpath = os.environ.get("PYTHONPATH", "")
+    if clean_pythonpath:
+        roots.append(clean_pythonpath)
+
+    return sep.join(roots)
+
+
 def _compute_manifest_hash(repo_dir: Path) -> str:
     """
     Computes a deterministic SHA-256 hash of repository dependency manifests
-    (requirements.txt, pyproject.toml, setup.py, setup.cfg, Pipfile).
+    (requirements.txt, pyproject.toml, setup.py, setup.cfg, Pipfile across root and subdirs).
     """
     hasher = hashlib.sha256()
-    manifest_candidates = [
-        "requirements.txt",
-        "pyproject.toml",
-        "setup.py",
-        "setup.cfg",
-        "Pipfile",
-    ]
-    found = False
-    for filename in manifest_candidates:
-        candidate_path = repo_dir / filename
-        if candidate_path.is_file():
-            found = True
-            hasher.update(filename.encode("utf-8"))
-            try:
-                hasher.update(candidate_path.read_bytes())
-            except Exception:
-                pass
-    if not found:
+    manifests = _find_workspace_manifests(repo_dir)
+    if not manifests:
         hasher.update(b"no-manifest")
+        return hasher.hexdigest()[:16]
+
+    for manifest_path in manifests:
+        try:
+            rel = str(manifest_path.relative_to(repo_dir))
+        except ValueError:
+            rel = manifest_path.name
+        hasher.update(rel.encode("utf-8"))
+        try:
+            hasher.update(manifest_path.read_bytes())
+        except Exception:
+            pass
+
     return hasher.hexdigest()[:16]
 
 
@@ -498,15 +582,11 @@ def _run_local_process_sandbox(
 
     # Build scrubbed environment (PATH, HOME, PYTHONPATH, and PIP flags only)
     bin_dir = str(venv_path / ("Scripts" if os.name == "nt" else "bin"))
-    repo_str = str(repo_dir)
-    src_str = str(repo_dir / "src")
+    full_pythonpath = _discover_pythonpath_roots(repo_dir)
 
     system_path = "C:\\Windows\\system32;C:\\Windows" if os.name == "nt" else "/usr/bin:/bin"
     sep = ";" if os.name == "nt" else ":"
     full_path = f"{bin_dir}{sep}{system_path}"
-
-    clean_pythonpath = os.environ.get("PYTHONPATH", "")
-    full_pythonpath = f"{repo_str}:{src_str}:{clean_pythonpath}" if clean_pythonpath else f"{repo_str}:{src_str}"
 
     clean_home = os.environ.get("HOME", str(Path.home()))
 
@@ -619,16 +699,24 @@ def _run_local_process_sandbox(
             )
 
         # Pip-install baseline pins for BASELINE and patched manifest for PATCHED
-        req_file = repo_dir / "requirements.txt"
-        pyproject_file = repo_dir / "pyproject.toml"
+        manifests = _find_workspace_manifests(repo_dir)
+        install_errors = []
+        any_installed = False
 
-        install_cmd = None
-        if req_file.exists():
-            install_cmd = [str(venv_pip), "install", "--no-cache-dir", "--only-binary=:all:", "-r", str(req_file)]
-        elif pyproject_file.exists():
-            install_cmd = [str(venv_pip), "install", "--no-cache-dir", "--only-binary=:all:", str(repo_dir)]
+        if not manifests:
+            pyproject_file = repo_dir / "pyproject.toml"
+            if pyproject_file.exists():
+                manifests = [pyproject_file]
 
-        if install_cmd:
+        for manifest_file in manifests:
+            is_req_txt = manifest_file.name.startswith("requirements") or manifest_file.suffix == ".txt"
+            if is_req_txt:
+                install_cmd = [str(venv_pip), "install", "--no-cache-dir", "--only-binary=:all:", "-r", str(manifest_file)]
+            elif manifest_file.name == "pyproject.toml":
+                install_cmd = [str(venv_pip), "install", "--no-cache-dir", "--only-binary=:all:", str(manifest_file.parent)]
+            else:
+                continue
+
             try:
                 deps_inst = subprocess.run(
                     install_cmd,
@@ -637,18 +725,18 @@ def _run_local_process_sandbox(
                     timeout=120,
                     env=scrubbed_env,
                 )
-                if deps_inst.returncode != 0 and req_file.exists():
-                    # If building from source failed (e.g. historical exact pins lack pre-built wheels on newer Python versions),
-                    # attempt relaxing exact '==' pins to '>=' to allow installing platform-compatible pre-built wheels.
+                if deps_inst.returncode == 0:
+                    any_installed = True
+                elif is_req_txt:
+                    # Pass 2: Relax exact '==' to '>='
                     try:
-                        content = req_file.read_text(encoding="utf-8")
+                        content = manifest_file.read_text(encoding="utf-8")
                         relaxed_lines = []
                         for line in content.splitlines():
                             stripped = line.strip()
                             if not stripped or stripped.startswith("#"):
                                 relaxed_lines.append(line)
                                 continue
-                            pkg_name = re.split(r"[=<>]", stripped)[0].strip().lower()
                             if "==" in line:
                                 print(f"  ⚠️ [Sandbox] Exact pin '{stripped}' failed to install; relaxing to '>=' (baseline/patched may no longer differ only by the migration)", flush=True)
                                 relaxed_line = line.replace("==", ">=")
@@ -672,49 +760,53 @@ def _run_local_process_sandbox(
                                 os.unlink(temp_rf_path)
                             except Exception:
                                 pass
+                            if deps_inst.returncode == 0:
+                                any_installed = True
                     except Exception:
                         pass
 
-                if deps_inst.returncode != 0:
-                    duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
-                    manifest_name = "requirements.txt" if req_file.exists() else "pyproject.toml"
-                    stdout_log = deps_inst.stdout or ""
-                    if pins_relaxed:
-                        if stdout_log and not stdout_log.endswith("\n"):
-                            stdout_log += "\n"
-                        stdout_log += "PINS RELAXED\n"
-                    return SandboxRunAttempt(
-                        attempt_number=attempt_num,
-                        job_id=job_id,
-                        execution_target=exec_target,
-                        exit_code=deps_inst.returncode,
-                        passed_count=0,
-                        failed_count=1,
-                        duration_ms=duration_ms,
-                        stdout_log=stdout_log,
-                        stderr_traceback=(
-                            f"Failed to pip-install {target_label} dependencies from {manifest_name} into venv:\n"
-                            f"{deps_inst.stderr}"
-                        ).strip(),
-                        pins_relaxed=pins_relaxed,
-                    )
+                    # Pass 3: Resilient line-by-line fallback if batch install failed and multiple packages exist
+                    req_lines = [l.strip() for l in content.splitlines() if l.strip() and not l.strip().startswith("#")]
+                    if deps_inst.returncode != 0 and len(req_lines) > 1:
+                        try:
+                            for line in req_lines:
+                                line_inst = subprocess.run(
+                                    [str(venv_pip), "install", "--no-cache-dir", "--prefer-binary", line],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=60,
+                                    env=scrubbed_env,
+                                )
+                                if line_inst.returncode == 0:
+                                    any_installed = True
+                                else:
+                                    pins_relaxed = True
+                                    print(f"  ⚠️ [Sandbox Notice] Skipped incompatible package pin '{line}': {line_inst.stderr.strip()}", flush=True)
+                        except Exception:
+                            pass
+
+                if deps_inst.returncode != 0 and not any_installed:
+                    install_errors.append(f"Failed to pip-install {target_label} dependencies from {manifest_file.name} into venv:\n{deps_inst.stderr}")
             except Exception as exc:
-                duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
-                stdout_log = ""
-                if pins_relaxed:
-                    stdout_log = "PINS RELAXED\n"
-                return SandboxRunAttempt(
-                    attempt_number=attempt_num,
-                    job_id=job_id,
-                    execution_target=exec_target,
-                    exit_code=1,
-                    passed_count=0,
-                    failed_count=1,
-                    duration_ms=duration_ms,
-                    stdout_log=stdout_log,
-                    stderr_traceback=f"Exception installing {target_label} dependencies into venv: {exc}",
-                    pins_relaxed=pins_relaxed,
-                )
+                install_errors.append(f"Exception installing {target_label} dependencies from {manifest_file.name} into venv: {exc}")
+
+        if manifests and install_errors and not any_installed:
+            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+            stdout_log = ""
+            if pins_relaxed:
+                stdout_log = "PINS RELAXED\n"
+            return SandboxRunAttempt(
+                attempt_number=attempt_num,
+                job_id=job_id,
+                execution_target=exec_target,
+                exit_code=1,
+                passed_count=0,
+                failed_count=1,
+                duration_ms=duration_ms,
+                stdout_log=stdout_log,
+                stderr_traceback="\n".join(install_errors).strip(),
+                pins_relaxed=pins_relaxed,
+            )
 
         try:
             if pins_relaxed:

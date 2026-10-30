@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 900; // Allow migrations up to 15 minutes without route timeout
 
 // Validate frontend caller credential against DRIFTZERO_UI_TOKEN
 function verifyUiAuth(req: NextRequest): NextResponse | null {

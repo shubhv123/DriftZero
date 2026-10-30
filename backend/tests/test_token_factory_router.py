@@ -8,6 +8,7 @@ import pytest
 from backend.intelligence.telemetry_tracker import PipelineTelemetrySummary
 from backend.intelligence.token_factory_router import (
     _validate_patch,
+    _splice_ast_patch,
     patch_single_file_via_token_factory,
     execute_stage2_and_stage3_pipeline,
 )
@@ -570,3 +571,93 @@ def test_validate_patch_fails_closed_when_target_python_unusable(monkeypatch):
     valid, err = _validate_patch(cand, orig, "pydantic", [], target_python="/nonexistent/python")
     assert valid is False
     assert "could not run" in err
+
+
+def test_splice_ast_patch_preserves_untouched_definitions():
+    original = (
+        "import os\n"
+        "from pydantic import BaseModel\n\n"
+        "class SwarmConfig(BaseModel):\n"
+        "    max_retries: int = 3\n\n"
+        "def helper_tool():\n"
+        "    return 'ok'\n\n"
+        "def run_autonomous_mission(goal: str):\n"
+        "    '''Long mission runner that should never be dropped.'''\n"
+        "    return f'executing {goal}'\n"
+    )
+    # Candidate only provides SwarmConfig with extra field and helper_tool with modification, omitting run_autonomous_mission
+    candidate = (
+        "from pydantic import BaseModel\n\n"
+        "class SwarmConfig(BaseModel):\n"
+        "    max_retries: int = 5\n"
+        "    timeout: int = 60\n\n"
+        "def helper_tool():\n"
+        "    return 'enhanced'\n"
+    )
+    spliced = _splice_ast_patch(original, candidate)
+    assert "class SwarmConfig(BaseModel):" in spliced
+    assert "max_retries: int = 5" in spliced
+    assert "timeout: int = 60" in spliced
+    assert "return 'enhanced'" in spliced
+    assert "def run_autonomous_mission(goal: str):" in spliced
+    assert "Long mission runner that should never be dropped." in spliced
+
+
+def test_stage3_ast_splice_fallback_on_missing_functions():
+    original = (
+        "from pydantic import BaseModel\n\n"
+        "class Item(BaseModel):\n"
+        "    name: str\n\n"
+        "def run_autonomous_mission():\n"
+        "    return 42\n"
+    )
+    # Candidate updates Item to v2 model_dump pattern but forgets run_autonomous_mission
+    partial_candidate = (
+        "```python\n"
+        "from pydantic import BaseModel\n\n"
+        "class Item(BaseModel):\n"
+        "    name: str\n"
+        "    def dump(self):\n"
+        "        return self.model_dump()\n"
+        "```"
+    )
+    file_rep = AffectedFileReport(
+        file_path="agent_graph.py",
+        relative_path="agent_graph.py",
+        total_lines=len(original.splitlines()),
+        imports_found=["pydantic"],
+        usages=[],
+        raw_complexity_score=1,
+        normalized_score=1.0,
+        assigned_tier="NEMOTRON_SUPER",
+        target_model_id="super",
+        routing_reasons=[],
+        source_code=original,
+    )
+    delta = MigrationDelta(
+        library="pydantic",
+        from_version="1.10.0",
+        to_version="2.9.2",
+        tavily_queries_executed=[],
+        citations=[],
+        rules=[],
+        synthesized_by_model="test",
+        generation_latency_ms=10.0,
+    )
+    mock_client = MagicMock()
+    resp = MagicMock()
+    resp.choices = [MagicMock(message=MagicMock(content=partial_candidate, reasoning_content=None, model_extra=None))]
+    resp.usage = MagicMock(prompt_tokens=100, completion_tokens=50)
+    mock_client.chat.completions.create.return_value = resp
+
+    with patch("backend.intelligence.token_factory_router.NEBIUS_API_KEY", "mock-key"), \
+         patch("openai.OpenAI", return_value=mock_client):
+        res = patch_single_file_via_token_factory(file_rep, delta)
+        # Should succeed because AST splicing restored run_autonomous_mission!
+        assert res.status == "SUCCESS"
+        assert res.syntax_valid is True
+        assert "run_autonomous_mission" in res.patched_code
+        assert "model_dump" in res.patched_code
+        # Did not need to retry since the graft rescued it on first pass
+        assert mock_client.chat.completions.create.call_count == 1
+
