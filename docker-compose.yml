@@ -1,5 +1,3 @@
-version: '3.8'
-
 # Verification sandboxing requires one of the following execution modes:
 # 1. Nebius Serverless Jobs API (Recommended): Set NEBIUS_SERVERLESS_JOB_ENDPOINT in .env
 # 2. Local Docker Sandbox: Host Docker daemon access (e.g. mount /var/run/docker.sock)
