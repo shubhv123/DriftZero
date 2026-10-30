@@ -9,6 +9,8 @@ import {
   FileText,
   ChevronDown,
   ChevronUp,
+  Lock,
+  Key,
 } from "lucide-react";
 
 interface TopControlBarProps {
@@ -33,6 +35,8 @@ interface TopControlBarProps {
     buildLog?: string
   ) => void;
   onStopMigration: () => void;
+  isAuthenticated?: boolean;
+  onOpenAuthModal?: () => void;
 }
 
 export function TopControlBar({
@@ -48,6 +52,8 @@ export function TopControlBar({
   isRunning,
   onRunMigration,
   onStopMigration,
+  isAuthenticated = false,
+  onOpenAuthModal,
 }: TopControlBarProps) {
   const [internalLib, setInternalLib] = useState("");
   const [internalVer, setInternalVer] = useState("");
@@ -154,6 +160,34 @@ export function TopControlBar({
               <ChevronDown className="w-3 h-3 text-neutral-400" />
             )}
           </button>
+
+          {/* UI Auth Button */}
+          {onOpenAuthModal && (
+            <button
+              type="button"
+              id="ui-auth-btn"
+              onClick={onOpenAuthModal}
+              title={
+                isAuthenticated
+                  ? "Authenticated with DRIFTZERO_UI_TOKEN"
+                  : "Sign in with DRIFTZERO_UI_TOKEN"
+              }
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border text-xs font-mono transition-colors flex-shrink-0 ${
+                isAuthenticated
+                  ? "bg-neutral-900 border-neutral-700 text-neutral-300 hover:text-white"
+                  : "bg-neutral-900 border-neutral-800 text-neutral-400 hover:text-white"
+              }`}
+            >
+              {isAuthenticated ? (
+                <Key className="w-3.5 h-3.5 text-neutral-300" />
+              ) : (
+                <Lock className="w-3.5 h-3.5 text-neutral-400" />
+              )}
+              <span className="hidden sm:inline">
+                {isAuthenticated ? "Auth OK" : "Auth"}
+              </span>
+            </button>
+          )}
 
           {/* Autonomous Detection Pill */}
           {detectedInfo && (

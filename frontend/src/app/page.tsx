@@ -11,6 +11,7 @@ import { SandboxTerminalTab } from "../components/SandboxTerminalTab";
 import { ContextRulesExportTab } from "../components/ContextRulesExportTab";
 import { TavilyDeltaTab } from "../components/TavilyDeltaTab";
 import { OverviewTab } from "../components/OverviewTab";
+import { LoginPromptModal } from "../components/LoginPromptModal";
 import {
   AffectedFile,
   BlastRadiusReport,
@@ -38,6 +39,41 @@ export default function DriftZeroCommandCenter() {
   const [rightPaneTab, setRightPaneTab] = useState<
     "overview" | "diff" | "sandbox" | "rules" | "delta"
   >("diff");
+
+  // Authentication State for DRIFTZERO_UI_TOKEN
+  const [uiToken, setUiToken] = useState<string>("");
+  const [showAuthModal, setShowAuthModal] = useState<boolean>(false);
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
+  const [authModalError, setAuthModalError] = useState<string | null>(null);
+
+  // Check saved token in localStorage and verify session cookie on mount
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const savedToken = localStorage.getItem("driftzero_ui_token") || "";
+      if (savedToken) {
+        setUiToken(savedToken);
+      }
+      fetch("/api/auth")
+        .then((res) => res.json())
+        .then((data) => {
+          if (data?.authenticated) {
+            setIsAuthenticated(true);
+          } else if (savedToken) {
+            // Re-authenticate with saved token to refresh httpOnly cookie
+            fetch("/api/auth", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ token: savedToken }),
+            })
+              .then((r) => {
+                if (r.ok) setIsAuthenticated(true);
+              })
+              .catch(() => {});
+          }
+        })
+        .catch(() => {});
+    }
+  }, []);
 
   // Pipeline Execution State
   const [isRunning, setIsRunning] = useState<boolean>(false);
@@ -151,11 +187,22 @@ export default function DriftZeroCommandCenter() {
     const streamUrl = "/api/migrate/stream";
 
     try {
+      const activeUiToken =
+        uiToken ||
+        (typeof window !== "undefined"
+          ? localStorage.getItem("driftzero_ui_token") || ""
+          : "");
+
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
+      if (activeUiToken) {
+        headers["x-driftzero-ui"] = activeUiToken;
+      }
+
       const response = await fetch(streamUrl, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers,
         body: JSON.stringify({
           repo_url: activeRepo.trim(),
           target_library: activeLib?.trim() || null,
@@ -164,6 +211,17 @@ export default function DriftZeroCommandCenter() {
         }),
         signal: controller.signal,
       });
+
+      if (response.status === 401) {
+        setIsRunning(false);
+        setIsError(true);
+        const errJson = await response.json().catch(() => ({}));
+        const msg = errJson.error || "Authentication required: Please enter your DRIFTZERO_UI_TOKEN.";
+        setErrorMessage(msg);
+        setAuthModalError(msg);
+        setShowAuthModal(true);
+        return;
+      }
 
       if (!response.ok || !response.body) {
         throw new Error(`Server returned HTTP ${response.status}: ${response.statusText}`);
@@ -496,6 +554,11 @@ export default function DriftZeroCommandCenter() {
           isRunning={isRunning}
           onRunMigration={startMigration}
           onStopMigration={stopMigration}
+          isAuthenticated={isAuthenticated}
+          onOpenAuthModal={() => {
+            setAuthModalError(null);
+            setShowAuthModal(true);
+          }}
         />
 
         {/* B. Live 5-Stage Pipeline Stepper */}
@@ -724,6 +787,20 @@ export default function DriftZeroCommandCenter() {
           </div>
         </main>
       </div>
+
+      {/* Notion-style Login / Auth Modal */}
+      <LoginPromptModal
+        isOpen={showAuthModal}
+        onClose={() => setShowAuthModal(false)}
+        onSuccess={(token) => {
+          setUiToken(token);
+          setIsAuthenticated(true);
+          setIsError(false);
+          setErrorMessage(null);
+          setAuthModalError(null);
+        }}
+        initialError={authModalError}
+      />
     </div>
   );
 }

@@ -44,6 +44,7 @@ services:
       - BACKEND_URL=http://backend:8000
       - NEXT_PUBLIC_API_URL=http://localhost:8000
       - DRIFTZERO_API_KEY=${DRIFTZERO_API_KEY:?set DRIFTZERO_API_KEY in .env (openssl rand -hex 32)}
+      - DRIFTZERO_UI_TOKEN=${DRIFTZERO_UI_TOKEN:-}
     depends_on:
       - backend
     restart: unless-stopped

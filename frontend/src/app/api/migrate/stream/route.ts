@@ -2,6 +2,39 @@ import { NextRequest, NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
 
+// Validate frontend caller credential against DRIFTZERO_UI_TOKEN
+function verifyUiAuth(req: NextRequest): NextResponse | null {
+  const expectedToken = (process.env.DRIFTZERO_UI_TOKEN || "").trim();
+
+  // Refuse to proxy at all if DRIFTZERO_UI_TOKEN is unset
+  if (!expectedToken) {
+    return NextResponse.json(
+      { error: "Unauthorized: DRIFTZERO_UI_TOKEN is not configured on the frontend server" },
+      { status: 401 }
+    );
+  }
+
+  // Compare with the x-driftzero-ui header or an httpOnly cookie
+  const headerToken = (req.headers.get("x-driftzero-ui") || "").trim();
+  const cookieToken = (
+    req.cookies.get("driftzero_ui_token")?.value ||
+    req.cookies.get("x-driftzero-ui")?.value ||
+    ""
+  ).trim();
+
+  const isHeaderValid = Boolean(headerToken && headerToken === expectedToken);
+  const isCookieValid = Boolean(cookieToken && cookieToken === expectedToken);
+
+  if (!isHeaderValid && !isCookieValid) {
+    return NextResponse.json(
+      { error: "Unauthorized: Invalid or missing UI token (x-driftzero-ui or driftzero_ui_token cookie)" },
+      { status: 401 }
+    );
+  }
+
+  return null;
+}
+
 // The right-most X-Forwarded-For hop is the one appended by the trusted proxy in front of
 // Next.js; earlier hops are client-controlled and must not be used for rate limiting.
 function realPeer(req: NextRequest): string {
@@ -14,6 +47,12 @@ function realPeer(req: NextRequest): string {
 }
 
 export async function POST(req: NextRequest) {
+  // Enforce caller credential before building headers or proxying request
+  const authErr = verifyUiAuth(req);
+  if (authErr) {
+    return authErr;
+  }
+
   const backendUrl =
     process.env.BACKEND_URL ||
     process.env.NEXT_PUBLIC_BACKEND_URL ||
@@ -72,6 +111,12 @@ export async function POST(req: NextRequest) {
 }
 
 export async function GET(req: NextRequest) {
+  // Enforce caller credential before building headers or proxying request
+  const authErr = verifyUiAuth(req);
+  if (authErr) {
+    return authErr;
+  }
+
   const backendUrl =
     process.env.BACKEND_URL ||
     process.env.NEXT_PUBLIC_BACKEND_URL ||
@@ -129,4 +174,3 @@ export async function GET(req: NextRequest) {
     );
   }
 }
-
