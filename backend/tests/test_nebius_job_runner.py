@@ -138,12 +138,13 @@ def test_local_process_sandbox_venv_per_run_and_failure_reporting(monkeypatch):
                 return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Installed pytest", stderr="")
             # 3. pip install requirements
             elif "pip" in cmd[0] and "install" in cmd and "-r" in cmd:
+                assert "--only-binary=:all:" in cmd
                 assert "requirements.txt" in str(cmd[-1])
                 return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Installed reqs", stderr="")
             # 4. pytest execution
-            elif "python" in cmd[0] and "-m" in cmd and "pytest" in cmd:
+            elif any("python" in arg for arg in cmd) and "-m" in cmd and "pytest" in cmd:
                 # Ensure it executes with the venv python
-                assert "driftzero_venv_patched_" in cmd[0]
+                assert any("driftzero_venv_patched_" in arg for arg in cmd)
                 return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="2 passed in 0.10s", stderr="")
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
@@ -195,8 +196,9 @@ def test_local_process_sandbox_pip_install_failure(monkeypatch):
 
 
 def test_local_process_sandbox_scrubbed_env(monkeypatch):
-    """Verify _run_local_process_sandbox passes a scrubbed env (PATH, HOME, PYTHONPATH only) and doesn't leak secrets."""
+    """Verify _run_local_process_sandbox passes a scrubbed env (PATH, HOME, PYTHONPATH, PIP flags) and doesn't leak secrets."""
     monkeypatch.setenv("ALLOW_UNSAFE_LOCAL_SANDBOX", "1")
+    monkeypatch.setenv("PATH", "/custom/host/bin:/usr/local/bin:/usr/bin:/bin")
     monkeypatch.setenv("NEBIUS_API_KEY", "super-secret-nebius-key")
     monkeypatch.setenv("TAVILY_API_KEY", "super-secret-tavily-key")
     monkeypatch.setenv("GITHUB_TOKEN", "super-secret-gh-pat")
@@ -231,10 +233,15 @@ def test_local_process_sandbox_scrubbed_env(monkeypatch):
             assert len(captured_envs) > 0
 
             for captured_env in captured_envs:
-                # Must contain PATH, HOME, PYTHONPATH
+                # Must contain PATH with ONLY venv bin + /usr/bin:/bin (no host /custom/host/bin)
                 assert "PATH" in captured_env
+                assert "/custom/host/bin" not in captured_env["PATH"]
+                assert captured_env["PATH"].endswith(":/usr/bin:/bin")
                 assert "HOME" in captured_env
                 assert "PYTHONPATH" in captured_env
+                # Must enforce PIP non-interactive settings
+                assert captured_env.get("PIP_NO_INPUT") == "1"
+                assert captured_env.get("PIP_DISABLE_PIP_VERSION_CHECK") == "1"
                 # Must contain extra_env
                 assert captured_env.get("DRIFTZERO_RECORD_GOLDEN") == "1"
                 # Must NOT leak host secrets
@@ -243,7 +250,14 @@ def test_local_process_sandbox_scrubbed_env(monkeypatch):
                 assert "GITHUB_TOKEN" not in captured_env
                 assert "DRIFTZERO_API_KEY" not in captured_env
                 # Verify allowed keys only
-                allowed_keys = {"PATH", "HOME", "PYTHONPATH", "DRIFTZERO_RECORD_GOLDEN"}
+                allowed_keys = {
+                    "PATH",
+                    "HOME",
+                    "PYTHONPATH",
+                    "PIP_NO_INPUT",
+                    "PIP_DISABLE_PIP_VERSION_CHECK",
+                    "DRIFTZERO_RECORD_GOLDEN",
+                }
                 assert set(captured_env.keys()).issubset(allowed_keys)
 
 
@@ -340,6 +354,7 @@ def test_relax_pins_sets_flag_and_stdout_log(monkeypatch):
             elif "pip" in cmd[0] and "install" in cmd and "-r" in cmd:
                 pip_attempts.append(cmd[-1])
                 if len(pip_attempts) == 1:
+                    assert "--only-binary=:all:" in cmd
                     # First install attempt with exact pin fails (e.g. no pre-built wheel)
                     return subprocess.CompletedProcess(
                         args=cmd,
@@ -348,8 +363,9 @@ def test_relax_pins_sets_flag_and_stdout_log(monkeypatch):
                         stderr="ERROR: Failed building wheel for pydantic==1.10.12",
                     )
                 # Second install attempt with relaxed pin succeeds
+                assert "--only-binary=:all:" not in cmd
                 return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Successfully installed pydantic>=1.10.12", stderr="")
-            elif "python" in cmd[0] and "-m" in cmd and "pytest" in cmd:
+            elif any("python" in arg for arg in cmd) and "-m" in cmd and "pytest" in cmd:
                 return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="1 passed in 0.05s\n", stderr="")
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
@@ -411,4 +427,133 @@ def test_stage4_passes_with_relaxed_pins_sets_needs_manual():
             report2 = execute_stage4_verification_loop(repo_dir, dummy_delta, max_retries=1)
             assert report2.final_status == "PASSED"
             assert report2.pins_relaxed is False
+
+
+def test_network_isolation_when_unshare_available(monkeypatch):
+    """Verify that when unshare is available and permitted, the test step runs prefixed with 'unshare -n'."""
+    monkeypatch.setenv("ALLOW_UNSAFE_LOCAL_SANDBOX", "1")
+    _reset_local_venv_cache_for_testing()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = Path(tmpdir) / "repo"
+        repo_dir.mkdir()
+        (repo_dir / "requirements.txt").write_text("pydantic==2.9.2\n", encoding="utf-8")
+        (repo_dir / "test_migration_parity.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+
+        test_step_cmds = []
+
+        def mock_subprocess_run(cmd, *args, **kwargs):
+            if "-m" in cmd and "venv" in cmd:
+                venv_dir = Path(cmd[-1])
+                bin_dir = venv_dir / "bin"
+                bin_dir.mkdir(parents=True, exist_ok=True)
+                (bin_dir / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+                (bin_dir / "pip").write_text("#!/bin/sh\n", encoding="utf-8")
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+            elif "pip" in cmd[0] and "install" in cmd:
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Installed", stderr="")
+            elif "-n" in cmd and "true" in cmd:
+                # unshare probe succeeds
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+            elif "pytest" in cmd:
+                test_step_cmds.append(list(cmd))
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="1 passed in 0.05s", stderr="")
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        with patch("shutil.which", return_value="/usr/bin/unshare"), \
+             patch("subprocess.run", side_effect=mock_subprocess_run):
+            res = _run_local_process_sandbox(repo_dir, "job-net-iso", 1, "PATCHED", 30)
+            assert res.exit_code == 0
+            assert len(test_step_cmds) == 1
+            cmd = test_step_cmds[0]
+            assert cmd[0] == "/usr/bin/unshare"
+            assert cmd[1] == "-n"
+            assert "pytest" in cmd
+            assert "Network isolation active: running tests in an isolated network namespace (unshare -n)" in res.stdout_log
+
+
+def test_network_isolation_fallback_when_unshare_missing(monkeypatch):
+    """Verify that when unshare is missing on the platform (macOS/Windows), tests run without unshare and document fallback."""
+    monkeypatch.setenv("ALLOW_UNSAFE_LOCAL_SANDBOX", "1")
+    _reset_local_venv_cache_for_testing()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = Path(tmpdir) / "repo"
+        repo_dir.mkdir()
+        (repo_dir / "requirements.txt").write_text("pydantic==2.9.2\n", encoding="utf-8")
+        (repo_dir / "test_migration_parity.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+
+        test_step_cmds = []
+
+        def mock_subprocess_run(cmd, *args, **kwargs):
+            if "-m" in cmd and "venv" in cmd:
+                venv_dir = Path(cmd[-1])
+                bin_dir = venv_dir / "bin"
+                bin_dir.mkdir(parents=True, exist_ok=True)
+                (bin_dir / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+                (bin_dir / "pip").write_text("#!/bin/sh\n", encoding="utf-8")
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+            elif "pip" in cmd[0] and "install" in cmd:
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Installed", stderr="")
+            elif "pytest" in cmd:
+                test_step_cmds.append(list(cmd))
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="1 passed in 0.05s", stderr="")
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        with patch("shutil.which", return_value=None), \
+             patch("subprocess.run", side_effect=mock_subprocess_run):
+            res = _run_local_process_sandbox(repo_dir, "job-net-missing", 1, "PATCHED", 30)
+            assert res.exit_code == 0
+            assert len(test_step_cmds) == 1
+            cmd = test_step_cmds[0]
+            assert "unshare" not in cmd
+            assert "pytest" in cmd
+            assert "Network isolation unavailable: 'unshare' utility not found" in res.stdout_log
+
+
+def test_network_isolation_fallback_when_unshare_unprivileged(monkeypatch):
+    """Verify that when unshare -n fails with EPERM, tests fall back to direct execution and document fallback reason."""
+    monkeypatch.setenv("ALLOW_UNSAFE_LOCAL_SANDBOX", "1")
+    _reset_local_venv_cache_for_testing()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = Path(tmpdir) / "repo"
+        repo_dir.mkdir()
+        (repo_dir / "requirements.txt").write_text("pydantic==2.9.2\n", encoding="utf-8")
+        (repo_dir / "test_migration_parity.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+
+        test_step_cmds = []
+
+        def mock_subprocess_run(cmd, *args, **kwargs):
+            if "-m" in cmd and "venv" in cmd:
+                venv_dir = Path(cmd[-1])
+                bin_dir = venv_dir / "bin"
+                bin_dir.mkdir(parents=True, exist_ok=True)
+                (bin_dir / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+                (bin_dir / "pip").write_text("#!/bin/sh\n", encoding="utf-8")
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+            elif "pip" in cmd[0] and "install" in cmd:
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Installed", stderr="")
+            elif "-n" in cmd and "true" in cmd:
+                # unshare probe fails with EPERM
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=1,
+                    stdout="",
+                    stderr="unshare: unshare failed: Operation not permitted",
+                )
+            elif "pytest" in cmd:
+                test_step_cmds.append(list(cmd))
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="1 passed in 0.05s", stderr="")
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        with patch("shutil.which", return_value="/usr/bin/unshare"), \
+             patch("subprocess.run", side_effect=mock_subprocess_run):
+            res = _run_local_process_sandbox(repo_dir, "job-net-eperm", 1, "PATCHED", 30)
+            assert res.exit_code == 0
+            assert len(test_step_cmds) == 1
+            cmd = test_step_cmds[0]
+            assert "unshare" not in cmd
+            assert "pytest" in cmd
+            assert "Network isolation unpermitted" in res.stdout_log
 

@@ -369,16 +369,82 @@ def _compute_manifest_hash(repo_dir: Path) -> str:
 
 
 _LOCAL_VENV_CACHE: Dict[Tuple[str, str], Path] = {}
+_CAN_UNSHARE_NET: Optional[bool] = None
 
 
 def _reset_local_venv_cache_for_testing() -> None:
-    """Clears the in-memory cache of local venvs and removes cached directories."""
+    """Clears the in-memory cache of local venvs, network isolation probe, and removes cached directories."""
+    global _CAN_UNSHARE_NET
+    _CAN_UNSHARE_NET = None
     _LOCAL_VENV_CACHE.clear()
     for p in Path(tempfile.gettempdir()).glob("driftzero_venv_*"):
         try:
             shutil.rmtree(p, ignore_errors=True)
         except Exception:
             pass
+
+
+def _check_network_isolation_support() -> Tuple[bool, List[str], str]:
+    """
+    Checks if network namespace isolation is supported on the current platform.
+
+    Returns:
+        (is_isolated: bool, prefix_cmd: List[str], documentation_message: str)
+
+    Fallback Documentation:
+    -----------------------
+    Network namespace isolation (`unshare -n`) is a Linux kernel feature provided by
+    util-linux (`CLONE_NEWNET`). When running on platforms without network namespace
+    support (such as macOS / Darwin or Windows), or inside unprivileged containers
+    that lack CAP_SYS_ADMIN capabilities:
+      - `unshare` is either not present in PATH, or returns EPERM ("Operation not permitted").
+      - Fallback behavior: DriftZero logs the fallback reason and executes the test command
+        without the network unshare wrapper. The execution environment remains constrained
+        by the scrubbed environment variables (PATH limited to venv bin and /usr/bin:/bin,
+        scrubbed secrets, and pip non-interactive flags) and filesystem isolation in the
+        isolated venv.
+    """
+    global _CAN_UNSHARE_NET
+    unshare_bin = shutil.which("unshare")
+    if not unshare_bin:
+        doc = (
+            "Network isolation unavailable: 'unshare' utility not found on this platform "
+            "(macOS/Windows or minimal environment). Falling back to direct execution."
+        )
+        return False, [], doc
+
+    if _CAN_UNSHARE_NET is False:
+        doc = (
+            "Network isolation unavailable: 'unshare -n' previously failed or lacked permissions "
+            "(e.g. unprivileged container lacking CAP_SYS_ADMIN). Falling back to direct execution."
+        )
+        return False, [], doc
+
+    if _CAN_UNSHARE_NET is True:
+        return True, [unshare_bin, "-n"], "Network isolation active: running tests in an isolated network namespace (unshare -n)."
+
+    # Probe once
+    try:
+        probe = subprocess.run(
+            [unshare_bin, "-n", "true"],
+            capture_output=True,
+            timeout=2,
+        )
+        if probe.returncode == 0:
+            _CAN_UNSHARE_NET = True
+            return True, [unshare_bin, "-n"], "Network isolation active: running tests in an isolated network namespace (unshare -n)."
+        else:
+            _CAN_UNSHARE_NET = False
+            err = (probe.stderr or "").strip()
+            doc = (
+                f"Network isolation unpermitted: 'unshare -n' exited with code {probe.returncode} "
+                f"({err or 'permission denied'}). Falling back to direct execution."
+            )
+            return False, [], doc
+    except Exception as exc:
+        _CAN_UNSHARE_NET = False
+        doc = f"Network isolation probe failed ({exc}). Falling back to direct execution."
+        return False, [], doc
 
 
 def _run_local_process_sandbox(
@@ -430,13 +496,14 @@ def _run_local_process_sandbox(
     venv_pip = venv_path / ("Scripts/pip.exe" if os.name == "nt" else "bin/pip")
     ready_marker = venv_path / ".driftzero_ready"
 
-    # Build scrubbed environment (PATH, HOME, PYTHONPATH only)
+    # Build scrubbed environment (PATH, HOME, PYTHONPATH, and PIP flags only)
     bin_dir = str(venv_path / ("Scripts" if os.name == "nt" else "bin"))
     repo_str = str(repo_dir)
     src_str = str(repo_dir / "src")
 
-    clean_path = os.environ.get("PATH", "")
-    full_path = f"{bin_dir}:{clean_path}" if clean_path else bin_dir
+    system_path = "C:\\Windows\\system32;C:\\Windows" if os.name == "nt" else "/usr/bin:/bin"
+    sep = ";" if os.name == "nt" else ":"
+    full_path = f"{bin_dir}{sep}{system_path}"
 
     clean_pythonpath = os.environ.get("PYTHONPATH", "")
     full_pythonpath = f"{repo_str}:{src_str}:{clean_pythonpath}" if clean_pythonpath else f"{repo_str}:{src_str}"
@@ -447,6 +514,8 @@ def _run_local_process_sandbox(
         "PATH": full_path,
         "HOME": clean_home,
         "PYTHONPATH": full_pythonpath,
+        "PIP_NO_INPUT": "1",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
     }
     if extra_env:
         scrubbed_env.update(extra_env)
@@ -555,9 +624,9 @@ def _run_local_process_sandbox(
 
         install_cmd = None
         if req_file.exists():
-            install_cmd = [str(venv_pip), "install", "--no-cache-dir", "-r", str(req_file)]
+            install_cmd = [str(venv_pip), "install", "--no-cache-dir", "--only-binary=:all:", "-r", str(req_file)]
         elif pyproject_file.exists():
-            install_cmd = [str(venv_pip), "install", "--no-cache-dir", str(repo_dir)]
+            install_cmd = [str(venv_pip), "install", "--no-cache-dir", "--only-binary=:all:", str(repo_dir)]
 
         if install_cmd:
             try:
@@ -659,8 +728,10 @@ def _run_local_process_sandbox(
         if (venv_path / "PINS_RELAXED").exists():
             pins_relaxed = True
 
-    # 3. Run pytest with that venv's python
-    cmd = [str(venv_python), "-m", "pytest", "test_migration_parity.py", "-v", "--tb=short"]
+    # 3. Run pytest with that venv's python with network access disabled where supported
+    is_isolated, net_prefix, net_doc = _check_network_isolation_support()
+    base_test_cmd = [str(venv_python), "-m", "pytest", "test_migration_parity.py", "-v", "--tb=short"]
+    cmd = net_prefix + base_test_cmd
     try:
         proc = subprocess.run(
             cmd,
@@ -681,7 +752,11 @@ def _run_local_process_sandbox(
         elif proc.returncode != 0 and proc.stdout:
             traceback_excerpt = proc.stdout
 
-        stdout_log = f"[{target_label} Process Sandbox - LOCAL RUNNER (venv: {venv_path.name})]\n{proc.stdout}"
+        stdout_log = (
+            f"[{target_label} Process Sandbox - LOCAL RUNNER (venv: {venv_path.name})]\n"
+            f"[{net_doc}]\n"
+            f"{proc.stdout}"
+        )
         if pins_relaxed:
             if stdout_log and not stdout_log.endswith("\n"):
                 stdout_log += "\n"
