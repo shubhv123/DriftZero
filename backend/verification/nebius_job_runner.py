@@ -578,6 +578,7 @@ def _run_local_process_sandbox(
                                 continue
                             pkg_name = re.split(r"[=<>]", stripped)[0].strip().lower()
                             if pkg_name in ("pydantic", "pydantic-core", "fastapi"):
+                                print(f"  ⚠️ [Sandbox] Exact pin '{stripped}' failed to install; relaxing to '>=' (baseline/patched may no longer differ only by the migration)", flush=True)
                                 relaxed_lines.append(line.replace("==", ">="))
                             else:
                                 relaxed_lines.append(line)

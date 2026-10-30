@@ -191,7 +191,7 @@ class User(BaseModel):
 """
     transformed, modified = apply_deterministic_codemods(code, target_library="pydantic")
     assert modified is True
-    assert "from typing import Self" in transformed
+    assert "from typing_extensions import Self" in transformed
     assert "from pydantic import BaseModel, model_validator" in transformed
     assert '@model_validator(mode="before")' in transformed
     assert '@model_validator(mode="after")' in transformed
@@ -405,3 +405,20 @@ res = b.dict()
     assert resolved[0].status == "SUCCESS"
     assert resolved[0].telemetry.prompt_tokens == 0
     assert resolved[0].telemetry.model_used == "LIBCST_DETERMINISTIC_CODEMOD"
+
+
+def test_construct_file_is_not_auto_resolved_and_self_uses_typing_extensions():
+    from backend.core.codemods import apply_deterministic_codemods
+
+    src = (
+        "from pydantic import BaseModel, root_validator\n"
+        "class M(BaseModel):\n"
+        "    a: int = 0\n"
+        "    @root_validator\n"
+        "    def r(cls, values):\n"
+        "        return values\n"
+    )
+    out, _ = apply_deterministic_codemods(src)
+    assert "from typing import" not in out or "Self" not in out.split("from typing import")[-1].splitlines()[0]
+    if "Self" in out:
+        assert "from typing_extensions import Self" in out

@@ -127,7 +127,8 @@ def test_startup_refuses_without_api_key(monkeypatch):
             pass
 
 
-def test_rate_limiting_keyed_by_ip_only():
+def test_rate_limiting_keyed_by_ip_only(monkeypatch):
+    monkeypatch.setenv("TRUSTED_PROXY", "1")
     client = TestClient(app)
     headers_key1 = {"X-API-Key": "test-secret-api-key", "X-Forwarded-For": "203.0.113.195"}
     headers_key2 = {"X-API-Key": "test-secret-api-key", "X-Forwarded-For": "203.0.113.195"}
@@ -150,7 +151,8 @@ def test_rate_limiting_keyed_by_ip_only():
     assert resp_other_ip.status_code == 200
 
 
-def test_rate_limiting_evicts_old_buckets():
+def test_rate_limiting_evicts_old_buckets(monkeypatch):
+    monkeypatch.setenv("TRUSTED_PROXY", "1")
     import time
     from unittest.mock import MagicMock
     from backend.main import _rate_limit_records, _check_rate_limit
@@ -227,3 +229,32 @@ def test_manifest_needs_manual_creates_draft_pr():
             assert payload["draft"] is True
             assert "[DRAFT]" in payload["title"]
 
+
+
+def test_rotating_xff_does_not_bypass_rate_limit(monkeypatch):
+    from fastapi.testclient import TestClient
+    import backend.main as m
+
+    monkeypatch.delenv("TRUSTED_PROXY", raising=False)
+    monkeypatch.setenv("DRIFTZERO_API_KEY", "k" * 32)
+    monkeypatch.setattr(m, "RATE_LIMIT_PER_MINUTE", 2)
+    m._rate_limit_records.clear()
+    body = {"repo_url": "", "library": "pydantic", "target_version": "2.9.2"}
+    with TestClient(m.app) as c:
+        codes = [
+            c.post("/api/migrate/stream", json=body,
+                   headers={"X-API-Key": "k" * 32, "X-Forwarded-For": f"10.0.0.{i}"}).status_code
+            for i in range(5)
+        ]
+    assert 429 in codes
+
+
+def test_placeholder_api_key_rejected_at_startup(monkeypatch):
+    import pytest
+    from fastapi.testclient import TestClient
+    import backend.main as m
+
+    monkeypatch.setenv("DRIFTZERO_API_KEY", "your_driftzero_api_key_here")
+    with pytest.raises(RuntimeError):
+        with TestClient(m.app):
+            pass

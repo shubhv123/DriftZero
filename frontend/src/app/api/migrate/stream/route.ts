@@ -2,6 +2,17 @@ import { NextRequest, NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
 
+// The right-most X-Forwarded-For hop is the one appended by the trusted proxy in front of
+// Next.js; earlier hops are client-controlled and must not be used for rate limiting.
+function realPeer(req: NextRequest): string {
+  const xff = req.headers.get("x-forwarded-for");
+  if (xff) {
+    const hop = xff.split(",").pop()?.trim();
+    if (hop) return hop;
+  }
+  return req.headers.get("x-real-ip")?.trim() || "127.0.0.1";
+}
+
 export async function POST(req: NextRequest) {
   const backendUrl =
     process.env.BACKEND_URL ||
@@ -28,11 +39,7 @@ export async function POST(req: NextRequest) {
     }
 
     // Forward client IP for rate limiting
-    const forwardedFor =
-      req.headers.get("x-forwarded-for") ||
-      req.headers.get("x-real-ip") ||
-      "127.0.0.1";
-    headers["X-Forwarded-For"] = forwardedFor;
+    headers["X-Forwarded-For"] = realPeer(req);
 
     const backendRes = await fetch(`${backendUrl}/api/migrate/stream`, {
       method: "POST",
@@ -89,11 +96,7 @@ export async function GET(req: NextRequest) {
       headers["Authorization"] = authHeader;
     }
 
-    const forwardedFor =
-      req.headers.get("x-forwarded-for") ||
-      req.headers.get("x-real-ip") ||
-      "127.0.0.1";
-    headers["X-Forwarded-For"] = forwardedFor;
+    headers["X-Forwarded-For"] = realPeer(req);
 
     const backendRes = await fetch(
       `${backendUrl}/api/migrate/stream?${searchParams}`,
