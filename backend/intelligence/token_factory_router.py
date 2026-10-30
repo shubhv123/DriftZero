@@ -151,21 +151,6 @@ def _get_target_python() -> str:
         if cand_py.exists():
             return str(cand_py)
 
-    # 4. Check for active sandbox venvs created in temp directory
-    try:
-        tmp_dir = Path(tempfile.gettempdir())
-        patched_venvs = sorted(
-            tmp_dir.glob("driftzero_venv_patched_*"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        for v in patched_venvs:
-            cand_py = v / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-            if cand_py.exists():
-                return str(cand_py)
-    except Exception:
-        pass
-
     # 5. Fallback to sys.executable
     return sys.executable
 
@@ -381,8 +366,8 @@ def _validate_patch(
                 return False, f"Import error under target version: {err_detail}"
         except subprocess.TimeoutExpired:
             return False, "Subprocess import timed out after 15 seconds"
-        except Exception:
-            pass
+        except Exception as exc:
+            return False, f"Import check could not run under target python ({py_exec}): {exc}"
     finally:
         if tmp_path and tmp_path.exists():
             try:
@@ -481,6 +466,7 @@ def patch_single_file_via_token_factory(
                 "- @root_validator -> @model_validator: NEVER use bare @model_validator without mode! Always specify mode parameter:\n"
                 "  * For mode='after': `@model_validator(mode='after')\ndef verify(self): ... return self` (INSTANCE method taking self, returning self).\n"
                 "  * For mode='before': `@model_validator(mode='before')\n@classmethod\ndef verify(cls, data: Any) -> Any: ... return data` (CLASS method taking cls, data).\n"
+                "- `.construct()` -> `.model_construct()` drops unknown keys unless the model sets extra='allow'; preserve v1 behavior (set extra='allow' or copy extras explicitly).\n"
                 "- BaseSettings is in pydantic_settings (from pydantic_settings import BaseSettings, SettingsConfigDict).\n"
             )
 

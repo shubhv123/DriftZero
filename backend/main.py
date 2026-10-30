@@ -39,6 +39,10 @@ async def lifespan(app: FastAPI):
         raise RuntimeError(
             "DRIFTZERO_API_KEY is required at startup. Refusing to boot without it."
         )
+    if expected_key.lower() in {"your_driftzero_api_key_here", "changeme", "change-me", "test", "secret"} or len(expected_key) < 16:
+        raise RuntimeError(
+            "DRIFTZERO_API_KEY is a placeholder or too short (<16 chars). Generate one with: openssl rand -hex 32"
+        )
     yield
 
 
@@ -127,13 +131,20 @@ def _check_api_key(
 
 
 def _get_client_ip(request: Request) -> str:
-    """Extracts client IP from X-Forwarded-For, X-Real-IP, or client host."""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
+    """
+    Returns the client IP. Forwarding headers are trusted ONLY when TRUSTED_PROXY=1
+    (backend sits behind a proxy you control); then the right-most X-Forwarded-For hop
+    (the one appended by that proxy) is used, never the client-supplied left-most value.
+    """
+    if os.getenv("TRUSTED_PROXY", "0") == "1":
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            hop = forwarded.split(",")[-1].strip()
+            if hop:
+                return hop
+        real_ip = request.headers.get("x-real-ip")
+        if real_ip and real_ip.strip():
+            return real_ip.strip()
     if request.client and request.client.host:
         return request.client.host
     return "127.0.0.1"

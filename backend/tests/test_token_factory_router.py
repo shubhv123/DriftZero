@@ -547,3 +547,11 @@ def test_patch_single_file_fails_when_retry_also_fails_validation():
         assert "Import error under target version: TypeError" in (res.error_message or "")
 
 
+
+
+def test_validate_patch_fails_closed_when_target_python_unusable(monkeypatch):
+    orig = "from pydantic import BaseModel\nclass User(BaseModel):\n    name: str\n"
+    cand = "from pydantic import BaseModel\nclass User(BaseModel):\n    name: str\n    age: int = 0\n"
+    valid, err = _validate_patch(cand, orig, "pydantic", [], target_python="/nonexistent/python")
+    assert valid is False
+    assert "could not run" in err

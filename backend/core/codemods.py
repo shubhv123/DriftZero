@@ -990,9 +990,6 @@ class PydanticImportUpdater(cst.CSTTransformer):
                     if self.need_generic_typing and "Generic" not in kept_names:
                         kept_aliases.append(cst.ImportAlias(name=cst.Name("Generic")))
                         kept_names.add("Generic")
-                    if self.need_self and "Self" not in kept_names:
-                        kept_aliases.append(cst.ImportAlias(name=cst.Name("Self")))
-                        kept_names.add("Self")
                     new_body.append(item.with_changes(names=kept_aliases))
                     continue
             new_body.append(item)
@@ -1009,11 +1006,12 @@ class PydanticImportUpdater(cst.CSTTransformer):
         typing_add = []
         if self.need_generic_typing and not self.typing_import_found:
             typing_add.append("Generic")
-        if self.need_self and not self.typing_import_found:
-            typing_add.append("Self")
         if typing_add:
             names = ", ".join(sorted(typing_add))
             new_stmts.append(cst.parse_statement(f"from typing import {names}"))
+        if self.need_self:
+            # typing.Self needs Python 3.11+; typing_extensions (a pydantic v2 dependency) works on 3.8+
+            new_stmts.append(cst.parse_statement("from typing_extensions import Self"))
 
         if self.add_settings and not self.settings_import_found:
             names = ", ".join(sorted(self.add_settings))
@@ -1239,6 +1237,11 @@ def partition_files_for_stage3(
                     if dep in sym_lower:
                         remaining_deprecated.append(sym_raw)
                         break
+
+        # Condition 2b: v1 `.construct()` keeps unknown keys; v2 `.model_construct()` drops them
+        # unless extra="allow", so this is a behavior change that needs review, not a pure rename.
+        if re.search(r"\.construct\s*\(", original_code):
+            remaining_deprecated.append(".construct() (extra-key behavior differs in v2)")
 
         # Condition 3: Zero uncovered symbols
         uncovered_in_file: List[str] = []
