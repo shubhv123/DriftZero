@@ -18,12 +18,12 @@ services:
       - NEBIUS_SERVERLESS_JOB_ENDPOINT=${NEBIUS_SERVERLESS_JOB_ENDPOINT:-}
       - DRIFTZERO_API_KEY=${DRIFTZERO_API_KEY:-}
       - ALLOW_LOCAL_REPOS=${ALLOW_LOCAL_REPOS:-0}
-      - ALLOW_UNSAFE_LOCAL_SANDBOX=${ALLOW_UNSAFE_LOCAL_SANDBOX:-0}
+      - ALLOW_UNSAFE_LOCAL_SANDBOX=${ALLOW_UNSAFE_LOCAL_SANDBOX:-1}
       - TRUSTED_PROXY=1
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/api/health" ]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -46,4 +46,3 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
-

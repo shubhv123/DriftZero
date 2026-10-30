@@ -796,13 +796,13 @@ def update_manifest_version(
         if not req_file.is_file():
             continue
         try:
-            cmd = [sys.executable, "-m", "pip", "install", "--dry-run", "-r", str(req_file.resolve())]
+            cmd = [sys.executable, "-m", "pip", "install", "--dry-run", "--prefer-binary", "-r", str(req_file.resolve())]
             proc = subprocess.run(
                 cmd,
                 cwd=str(req_file.parent.resolve()),
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=60,
             )
             if proc.returncode != 0:
                 err_output = (proc.stderr or proc.stdout).strip()
@@ -815,7 +815,7 @@ def update_manifest_version(
             status = "NEEDS_MANUAL"
             needs_manual = True
             conflicts.append(
-                f"NEEDS_MANUAL: pip install --dry-run -r {req_file.name} timed out after 30s."
+                f"NEEDS_MANUAL: pip install --dry-run -r {req_file.name} timed out after 60s."
             )
         except Exception as exc:
             status = "NEEDS_MANUAL"

@@ -119,7 +119,7 @@ export function BlastRadiusTree({
 
   const affectedFiles = blastReport?.affected_files && blastReport.affected_files.length > 0
     ? blastReport.affected_files
-    : DEFAULT_PREVIEW_FILES;
+    : [];
 
   const filteredFiles = useMemo(() => {
     return affectedFiles.filter((f) =>
@@ -288,7 +288,7 @@ export function BlastRadiusTree({
             </h3>
           </div>
           <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-neutral-400">
-            {blastReport ? `${blastReport.affected_files_count} files` : `${affectedFiles.length} files`}
+            {blastReport ? `${blastReport.affected_files_count} files` : "0 files"}
           </span>
         </div>
 
@@ -309,7 +309,19 @@ export function BlastRadiusTree({
       <div className="flex-1 overflow-y-auto p-2 space-y-0.5">
         {treeRoot.children.length === 0 ? (
           <div className="p-6 text-center text-neutral-500 text-xs flex flex-col items-center justify-center gap-2 h-full">
-            <span>No files match &quot;{searchFilter}&quot;</span>
+            {!blastReport ? (
+              <>
+                <FolderTree className="w-6 h-6 text-neutral-600 mb-1" />
+                <span className="font-medium text-neutral-400">No repository scanned yet</span>
+                <span className="text-[11px] text-neutral-600 max-w-[200px] leading-relaxed">
+                  Enter a repository URL above and click Fix Repository to discover affected files.
+                </span>
+              </>
+            ) : searchFilter ? (
+              <span>No files match &quot;{searchFilter}&quot;</span>
+            ) : (
+              <span>No affected files found for target migration</span>
+            )}
           </div>
         ) : (
           treeRoot.children.map((child) => renderNode(child, 0))

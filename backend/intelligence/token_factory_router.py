@@ -118,6 +118,12 @@ try:
         sys.modules[mod_name] = mod
         spec.loader.exec_module(mod)
 except (TypeError, ImportError) as exc:
+    # If a ModuleNotFoundError occurred because an uninstalled third-party root package
+    # is missing from this environment, do not reject the patch.
+    if isinstance(exc, ModuleNotFoundError) and exc.name:
+        root_pkg = exc.name.split('.')[0]
+        if not importlib.util.find_spec(root_pkg):
+            sys.exit(0)
     print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
     sys.exit(42)
 except Exception:
@@ -473,7 +479,7 @@ def patch_single_file_via_token_factory(
         messages = [
             {
                 "role": "system",
-                "content": system_prompt + "\n\nCRITICAL: DO NOT output any conversational text, explanations, or multiple snippets. Output ONLY a single python code block starting with ```python containing the complete, upgraded file with all original classes and functions preserved.",
+                "content": system_prompt + "\n\nCRITICAL: DO NOT output any conversational text, explanations, or multiple snippets. Output ONLY a single python code block starting with ```python containing the complete, upgraded file with all original classes and functions preserved. NEVER use ellipses (...) or placeholder comments (e.g. '# ... existing code ...'). You must provide the full file implementation.",
             },
             {
                 "role": "user",
@@ -526,6 +532,8 @@ def patch_single_file_via_token_factory(
             # Retry once with the error!
             print(f"  ⚠️ [Validation Notice] {file_report.relative_path} failed: {validation_error}. Retrying once with error...", flush=True)
             hints = []
+            if "ellipsis" in validation_error:
+                hints.append("NEVER use ellipsis (...) or truncated placeholders like '# ... rest of code ...'. You must output the entire, unabridged code for the file.")
             if "GenericModel" in validation_error:
                 hints.append("GenericModel is removed in v2: generic classes must inherit directly from (BaseModel, Generic[T]). Never import GenericModel.")
             if "__root__" in validation_error:

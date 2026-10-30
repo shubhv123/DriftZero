@@ -147,19 +147,27 @@ def _parse_rules_from_llm(raw_content: str) -> List[Dict[str, Any]]:
             except Exception:
                 pass
 
-    # 5. Fallback: extract individual JSON objects containing "symbol" and "new_syntax"
-    rule_blocks = re.findall(r'\{[^{}]*"symbol"[^{}]*"new_syntax"[^{}]*\}', content)
-    if rule_blocks:
-        extracted = []
-        for b in rule_blocks:
-            try:
-                obj = json.loads(b, strict=False)
-                if isinstance(obj, dict) and obj.get("symbol"):
-                    extracted.append(obj)
-            except Exception:
-                pass
-        if extracted:
-            return extracted
+    # 5. Resilient JSON scanner: extract any JSON objects containing "symbol" and ("new_syntax" or "old_syntax")
+    extracted_rules: List[Dict[str, Any]] = []
+    decoder = json.JSONDecoder()
+    pos = 0
+    while pos < len(content):
+        next_brace = content.find("{", pos)
+        if next_brace == -1:
+            break
+        try:
+            obj, end = decoder.raw_decode(content[next_brace:])
+            pos = next_brace + end
+            if isinstance(obj, dict):
+                if obj.get("rules") and isinstance(obj["rules"], list):
+                    return obj["rules"]
+                elif obj.get("symbol") and (obj.get("new_syntax") or obj.get("old_syntax")):
+                    extracted_rules.append(obj)
+        except Exception:
+            pos = next_brace + 1
+
+    if extracted_rules:
+        return extracted_rules
 
     print(f"  ⚠️ [_parse_rules_from_llm Warning] Unable to parse rules. Raw preview ({len(raw_content)} chars):\n{raw_content[:200]}...[tail]:\n{raw_content[-200:]}", flush=True)
     return []
@@ -249,11 +257,21 @@ def build_migration_delta(
                             f"Source: {url}\nTitle: {item.get('title', '')}\nExcerpt: {content_snip}"
                         )
 
-            # Identify top guide URL from the migration guide search
+            # Identify top guide URL from the migration guide search (preferring documentation over video/social links)
+            non_doc_domains = ("youtube.com", "youtu.be", "twitter.com", "x.com", "tiktok.com", "instagram.com")
             guide_res = search_results_by_type.get("guide", {}).get("results", [])
-            top_guide_url = guide_res[0].get("url") if guide_res else None
+            top_guide_url = None
+            for item in guide_res:
+                u = (item.get("url") or "").lower()
+                if not any(d in u for d in non_doc_domains):
+                    top_guide_url = item.get("url")
+                    break
             if not top_guide_url and citations:
-                top_guide_url = citations[0]
+                for c in citations:
+                    c_lower = c.lower()
+                    if not any(d in c_lower for d in non_doc_domains):
+                        top_guide_url = c
+                        break
 
             # Call tavily.extract on top guide URL and feed only sections matching unique_deprecated_symbols
             if top_guide_url:

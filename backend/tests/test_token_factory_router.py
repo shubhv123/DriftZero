@@ -415,6 +415,21 @@ def test_validate_patch_subprocess_other_runtime_errors_ignored():
     assert err is None
 
 
+def test_validate_patch_subprocess_uninstalled_external_package_ignored():
+    # If the candidate imports an external 3rd-party package not installed on the host,
+    # it must NOT be rejected as a broken patch.
+    orig = "class Agent:\n    pass\n"
+    cand = (
+        "from non_existent_external_3rd_party_pkg.tools import something\n"
+        "class Agent:\n"
+        "    pass\n"
+    )
+    rules = []
+    valid, err = _validate_patch(cand, orig, "non_existent_external_3rd_party_pkg", rules)
+    assert valid is True
+    assert err is None
+
+
 def test_patch_single_file_retries_on_validation_failure_and_succeeds():
     file_rep = AffectedFileReport(
         file_path="/fake/models.py",
