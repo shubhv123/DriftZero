@@ -58,6 +58,10 @@ patched_*/
 workspace_*/
 temp_*/
 
+# Docker local overrides
+docker-compose.override.yml
+!docker-compose.override.yml.example
+
 # OS & Editor Files
 .DS_Store
 .DS_Store?

@@ -11,8 +11,8 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     container_name: driftzero-backend
-    ports:
-      - "8000:8000"
+    expose:
+      - "8000"
     environment:
       - NEBIUS_API_KEY=${NEBIUS_API_KEY:-}
       - TAVILY_API_KEY=${TAVILY_API_KEY:-}

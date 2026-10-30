@@ -1,0 +1,16 @@
+# Development override: Publish backend port 8000 directly to host.
+# WARNING: When publishing port 8000 directly to clients, TRUSTED_PROXY must be set to 0
+# to ensure clients cannot bypass rate limiting via spoofed X-Forwarded-For headers.
+#
+# To use:
+#   cp docker-compose.override.yml.example docker-compose.override.yml
+#   docker compose up
+
+version: '3.8'
+
+services:
+  backend:
+    ports:
+      - "8000:8000"
+    environment:
+      - TRUSTED_PROXY=0
